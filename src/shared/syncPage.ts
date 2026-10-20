@@ -125,7 +125,7 @@ export type SyncHostMessage =
       state: SyncState;
       cookies: SyncCookie[];
       /** The page's open WebSockets, with the first frames each received (their handshake). */
-      sockets: Array<{ id: string; url: string; frames: SocketFrame[] }>;
+      sockets: Array<{ id: string; url: string; origin: string; frames: SocketFrame[] }>;
     }
   | { t: 'state'; tabId: string; state: SyncState; cookies?: { set: SyncCookie[]; removed: Array<Pick<SyncCookie, 'name' | 'domain' | 'path'>> } }
   | { t: 'action'; tabId: string; seq: number; action: SyncAction }
@@ -133,10 +133,13 @@ export type SyncHostMessage =
   | { t: 'gone'; tabId: string; error?: string }
   | ({ t: 'request'; tabId: string } & SyncRequest)
   | ({ t: 'response'; tabId: string } & SyncResponse)
-  /** A dialog opened on the owner, or was answered there (with the answer). */
-  | { t: 'dialog'; tabId: string; open: boolean; type: string; message: string; accept?: boolean; value?: string | null }
+  /** A dialog opened on the owner (`url`: the frame showing it), or was answered there. */
+  | { t: 'dialog'; tabId: string; open: boolean; type: string; message: string; url: string; accept?: boolean; value?: string | null }
   /** The owner's page WebSockets: copies never connect themselves, they get what the owner receives. */
-  | ({ t: 'socket'; tabId: string; id: string } & ({ event: 'open'; url: string } | ({ event: 'message' } & SocketFrame) | { event: 'close' }));
+  | ({ t: 'socket'; tabId: string; id: string } & SocketEvent);
+
+/** `origin`: of the document that opened the socket (only a frame of that origin gets its messages). */
+export type SocketEvent = { event: 'open'; url: string; origin: string } | ({ event: 'message' } & SocketFrame) | { event: 'close' };
 
 /**
  * A request of the owner's page whose answer goes to the copies: one that sends data right after an
@@ -239,10 +242,11 @@ export function echoKey(a: { kind: string; frame: FrameRef | null; target: Eleme
  * machine (Playwright's selectOption does that), because applying a value twice is harmless.
  * Copies (`replica`) never report script-set values (that is how they apply the owner's), refuse
  * to submit POST forms and do not open file pickers; the owning machine does those.
+ * Returns a function that reports typing still waiting to be sent, right away.
  */
-export function installSyncRecorder(emit: (json: string) => void, replica: boolean) {
+export function installSyncRecorder(emit: (json: string) => void, replica: boolean): () => void {
   const w = window as any;
-  if (w.__bettercodexRecorder) return;
+  if (w.__bettercodexRecorder) return () => {};
   w.__bettercodexRecorder = true;
 
   const clean = (s: string | null | undefined) => (s ?? '').replace(/\s+/g, ' ').trim().slice(0, 80);
@@ -478,6 +482,7 @@ export function installSyncRecorder(emit: (json: string) => void, replica: boole
       true,
     );
   }
+  return flushAll;
 }
 
 /**
@@ -700,9 +705,10 @@ export function syncPageOp(op: string, ref: ElementRef | null, arg?: any): any {
 export const SEED_PATH = '/__bettercodex_seed__';
 
 /**
- * Reads ('dump') or replaces ('restore') the IndexedDB databases of the page's origin. Runs inside
+ * Reads ('dump') or writes ('restore') the IndexedDB databases of the page's origin. Runs inside
  * pages like the functions above. Values travel as JSON with their types tagged; records that
- * cannot be copied (Web Crypto keys, for one) are left out, and so are large databases.
+ * cannot be copied (Web Crypto keys, for one) are left out, and so are large databases. Restoring
+ * resolves to true when every database of the dump was written.
  */
 export async function indexedDbOp(op: 'dump' | 'restore', arg?: any): Promise<any> {
   const LIMIT = 2 * 1024 * 1024;
@@ -716,14 +722,20 @@ export async function indexedDbOp(op: 'dump' | 'restore', arg?: any): Promise<an
 
   if (op === 'dump') {
     if (!/^https?:$/.test(location.protocol) || !indexedDB.databases) return null;
-    const rough = (v: any) => {
-      try {
-        if (v instanceof Blob) return v.size;
-        if (v instanceof ArrayBuffer || ArrayBuffer.isView(v)) return v.byteLength;
-        return JSON.stringify(v)?.length ?? 8;
-      } catch {
-        return 1024;
+    // Size of a value once encoded, counted before anything is read (blobs inside records too).
+    const rough = (v: any, depth = 0): number => {
+      if (v === null || v === undefined || typeof v === 'boolean' || typeof v === 'number' || typeof v === 'bigint') return 8;
+      if (typeof v === 'string') return v.length + 2;
+      if (v instanceof Blob) return Math.ceil(v.size * 1.4) + 32;
+      if (v instanceof ArrayBuffer || ArrayBuffer.isView(v)) return Math.ceil(v.byteLength * 1.4) + 32;
+      if (typeof v !== 'object' || depth > 40) return LIMIT + 1;
+      let size = 16;
+      const items: unknown[] = v instanceof Map ? [...v].flat() : v instanceof Set ? [...v] : Array.isArray(v) ? v : Object.entries(v).flat();
+      for (const item of items) {
+        size += rough(item, depth + 1);
+        if (size > LIMIT) break;
       }
+      return size;
     };
     const encode = async (v: any): Promise<any> => {
       if (v === null || typeof v === 'string' || typeof v === 'boolean') return v;
@@ -777,23 +789,33 @@ export async function indexedDbOp(op: 'dump' | 'restore', arg?: any): Promise<an
       db.onversionchange = () => db.close();
       try {
         const names = Array.from(db.objectStoreNames);
-        const raw: Array<{ store: IDBObjectStore; rows: Array<[any, any]> }> = [];
+        // Everything is read while the transaction is alive; encoding (blobs) comes after.
+        const raw: Array<{ meta: Omit<IndexedDbDump['databases'][number]['stores'][number], 'rows'>; rows: Array<[any, any]> }> = [];
         if (names.length) {
           const tx = db.transaction(names, 'readonly');
           let tooBig = false;
           for (const name of names) {
             const store = tx.objectStore(name);
+            const meta = {
+              name: store.name,
+              keyPath: store.keyPath,
+              autoIncrement: store.autoIncrement,
+              indexes: Array.from(store.indexNames).map((n) => {
+                const index = store.index(n);
+                return { name: index.name, keyPath: index.keyPath, unique: index.unique, multiEntry: index.multiEntry };
+              }),
+            };
             const rows = await read(store);
             if (!rows) {
               tooBig = true;
               break;
             }
-            raw.push({ store, rows });
+            raw.push({ meta, rows });
           }
           if (tooBig) continue;
         }
         const stores = [];
-        for (const { store, rows } of raw) {
+        for (const { meta, rows } of raw) {
           const encoded: Array<[unknown, unknown]> = [];
           for (const [k, v] of rows) {
             try {
@@ -802,16 +824,7 @@ export async function indexedDbOp(op: 'dump' | 'restore', arg?: any): Promise<an
               // not copyable: left out
             }
           }
-          stores.push({
-            name: store.name,
-            keyPath: store.keyPath,
-            autoIncrement: store.autoIncrement,
-            indexes: Array.from(store.indexNames).map((n) => {
-              const index = store.index(n);
-              return { name: index.name, keyPath: index.keyPath, unique: index.unique, multiEntry: index.multiEntry };
-            }),
-            rows: encoded,
-          });
+          stores.push({ ...meta, rows: encoded });
         }
         const dump = { name: db.name, version: db.version, stores };
         const size = JSON.stringify(dump).length;
@@ -872,14 +885,13 @@ export async function indexedDbOp(op: 'dump' | 'restore', arg?: any): Promise<an
         resolve(value);
       });
     });
-  for (const d of (arg?.databases ?? []) as IndexedDbDump['databases']) {
-    // Other copies of this origin close their connections when asked to (or the wait runs out).
-    await settle<void>((done) => {
-      const r = indexedDB.deleteDatabase(d.name);
-      r.onsuccess = r.onerror = () => done();
-    }, undefined);
-    const db = await settle<IDBDatabase | null>((done) => {
-      const r = indexedDB.open(d.name, d.version);
+  // Other copies of this origin may have a database open: it is never deleted (that would wait for
+  // them, and run whenever they let go). Stores are written in place; a missing store needs a new
+  // version, which is given up on (without harm) when others hold the database open.
+  const open = (d: IndexedDbDump['databases'][number], version?: number) =>
+    settle<IDBDatabase | null>((done) => {
+      let late = false;
+      const r = version === undefined ? indexedDB.open(d.name) : indexedDB.open(d.name, version);
       r.onupgradeneeded = () => {
         for (const s of d.stores) {
           if (r.result.objectStoreNames.contains(s.name)) continue;
@@ -887,18 +899,39 @@ export async function indexedDbOp(op: 'dump' | 'restore', arg?: any): Promise<an
           for (const ix of s.indexes) store.createIndex(ix.name, ix.keyPath, { unique: ix.unique, multiEntry: ix.multiEntry });
         }
       };
-      r.onsuccess = () => done(r.result);
+      r.onsuccess = () => {
+        r.result.onversionchange = () => r.result.close();
+        if (late) r.result.close();
+        else done(r.result);
+      };
       r.onerror = () => done(null);
+      setTimeout(() => (late = true), 2900);
     }, null);
-    if (!db) continue;
-    const names = d.stores.map((s) => s.name).filter((n) => db.objectStoreNames.contains(n));
+  let complete = true;
+  const existing = new Map((await indexedDB.databases()).map((info) => [info.name, info.version ?? 0]));
+  for (const d of (arg?.databases ?? []) as IndexedDbDump['databases']) {
+    const version = existing.get(d.name);
+    let db = await open(d, version === undefined ? d.version : Math.max(version, d.version));
+    if (db && d.stores.some((s) => !db!.objectStoreNames.contains(s.name))) {
+      const current = db.version;
+      db.close();
+      db = await open(d, current + 1);
+    }
+    if (!db) {
+      complete = false;
+      continue;
+    }
+    const names = d.stores.map((s) => s.name).filter((n) => db!.objectStoreNames.contains(n));
+    if (names.length < d.stores.length) complete = false;
     if (names.length) {
-      await settle<void>((done) => {
-        const tx = db.transaction(names, 'readwrite');
-        tx.oncomplete = tx.onerror = tx.onabort = () => done();
+      const written = await settle<boolean>((done) => {
+        const tx = db!.transaction(names, 'readwrite');
+        tx.oncomplete = () => done(true);
+        tx.onerror = tx.onabort = () => done(false);
         for (const s of d.stores) {
           if (!names.includes(s.name)) continue;
           const store = tx.objectStore(s.name);
+          store.clear();
           for (const [k, v] of s.rows) {
             try {
               const put = s.keyPath != null ? store.put(decode(v)) : store.put(decode(v), decode(k));
@@ -909,9 +942,10 @@ export async function indexedDbOp(op: 'dump' | 'restore', arg?: any): Promise<an
             }
           }
         }
-      }, undefined);
+      }, false);
+      if (!written) complete = false;
     }
     db.close();
   }
-  return true;
+  return complete;
 }

@@ -10,7 +10,7 @@ import {
   syncPageOp,
   type FrameRef,
   type IndexedDbDump,
-  type SocketFrame,
+  type SocketEvent,
   type SyncAction,
   type SyncClientMessage,
   type SyncCookie,
@@ -68,6 +68,8 @@ interface TabSync {
   publishDeadline: number;
   cleanups: Array<() => void>;
   requestSeq: number;
+  /** The frame showing the page's dialog, if one is open. */
+  dialogUrl: string;
 }
 
 /**
@@ -86,19 +88,15 @@ export class SyncHub {
         else if (ts.page && (ts.page.isClosed() || this.browser.get(ts.tabId)?.page !== ts.page)) this.end(ts, 'The tab went to sleep');
       }
     });
-    // A copy runs the same dialog and waits for the answer given here.
-    browser.on('dialog', (e: { tabId: string; dialog: { type: string; message: string } }) => {
-      const ts = this.tabs.get(e.tabId);
-      if (ts) this.broadcast(ts, { t: 'dialog', tabId: e.tabId, open: true, type: e.dialog.type, message: e.dialog.message }, null);
-    });
     // Copies never connect WebSockets themselves; they get what the owner's page receives.
-    browser.on('socket', (e: { tabId: string; id: string } & ({ event: 'open'; url: string } | ({ event: 'message' } & SocketFrame) | { event: 'close' })) => {
+    browser.on('socket', (e: { tabId: string; id: string } & SocketEvent) => {
       const ts = this.tabs.get(e.tabId);
       if (ts) this.broadcast(ts, { t: 'socket', ...e }, null);
     });
+    // A copy runs the same dialog and waits for the answer given here (see instrument for openings).
     browser.on('dialogClosed', (e: { tabId: string; type: string; message: string; accept: boolean; promptText: string | null }) => {
       const ts = this.tabs.get(e.tabId);
-      if (ts) this.broadcast(ts, { t: 'dialog', tabId: e.tabId, open: false, type: e.type, message: e.message, accept: e.accept, value: e.promptText }, null);
+      if (ts) this.broadcast(ts, { t: 'dialog', tabId: e.tabId, open: false, type: e.type, message: e.message, url: ts.dialogUrl, accept: e.accept, value: e.promptText }, null);
     });
   }
 
@@ -146,6 +144,7 @@ export class SyncHub {
         publishDeadline: 0,
         cleanups: [],
         requestSeq: 0,
+        dialogUrl: '',
       };
       this.tabs.set(tabId, ts);
     }
@@ -160,7 +159,7 @@ export class SyncHub {
       const cookies = await this.cookies();
       if (ts.dead || !ts.subscribers.has(client)) return;
       client.cookies = new Map(cookies.map((c) => [cookieKey(c), JSON.stringify(c)]));
-      const sockets = [...(this.browser.get(tabId)?.sockets ?? [])].map(([id, socket]) => ({ id, url: socket.url, frames: socket.frames }));
+      const sockets = [...(this.browser.get(tabId)?.sockets ?? [])].map(([id, socket]) => ({ id, url: socket.url, origin: socket.origin, frames: socket.frames }));
       send(client, { t: 'snapshot', tabId, state, cookies, sockets });
     } catch (err) {
       log.warn('sync subscribe', tabId, errorMessage(err));
@@ -226,6 +225,11 @@ export class SyncHub {
       if (frame) frame.url = e.url;
     });
     on('Page.frameDetached', (e) => ts.frames.delete(e.frameId));
+    // Which frame shows a dialog: a copy gives the answer only to a frame of the same origin.
+    on('Page.javascriptDialogOpening', (e) => {
+      ts.dialogUrl = e.url ?? '';
+      this.broadcast(ts, { t: 'dialog', tabId: ts.tabId, open: true, type: e.type, message: e.message ?? '', url: ts.dialogUrl }, null);
+    });
 
     // Sending data to a site makes copies refetch once the request is done (and new cookies are in).
     const unsafeAfterAction = (req: Request) =>
@@ -267,12 +271,16 @@ export class SyncHub {
     const deliver = async (req: Request, id: string) => {
       const res = await req.response().catch(() => null);
       if (!res) return failed(id);
+      const headers = (await res.headersArray().catch(() => [])).filter((h) => !HOP_HEADERS.has(h.name.toLowerCase()));
+      // A redirect has no body; the copy follows it like the owner did.
+      if (res.status() >= 300 && res.status() < 400) {
+        return this.broadcast(ts, { t: 'response', tabId: ts.tabId, id, status: res.status(), statusText: res.statusText(), headers, body: '' }, null);
+      }
       // Oversized answers are not read at all; the copy's request fails instead.
       const sizes = await req.sizes().catch(() => null);
       if (Number(res.headers()['content-length'] ?? 0) > MAX_RESPONSE_BYTES || (sizes?.responseBodySize ?? 0) > MAX_RESPONSE_BYTES) return failed(id);
       const body = await res.body().catch(() => null);
       if (!body || body.length > MAX_RESPONSE_BYTES) return failed(id);
-      const headers = (await res.headersArray().catch(() => [])).filter((h) => !HOP_HEADERS.has(h.name.toLowerCase()));
       this.broadcast(ts, { t: 'response', tabId: ts.tabId, id, status: res.status(), statusText: res.statusText(), headers, body: body.toString('base64') }, null);
     };
     const onRequestFinished = (req: Request) => {

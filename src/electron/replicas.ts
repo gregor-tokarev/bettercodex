@@ -22,6 +22,7 @@ import {
   type SyncAction,
   type SyncClientMessage,
   type SyncCookie,
+  type SyncField,
   type SyncHostMessage,
   type SyncRequest,
   type SyncResponse,
@@ -80,6 +81,8 @@ interface HeldRequest extends RequestIdentity {
 
 interface OwnerSocket {
   url: string;
+  /** Of the document that opened it; only a frame of this origin in the copy gets its messages. */
+  origin: string;
   frames: SocketFrame[];
   bytes: number;
   copy: CopySocket | null;
@@ -89,14 +92,20 @@ interface OwnerSocket {
 interface CopySocket {
   sid: number;
   frame: WebFrameMain;
+  origin: string;
   owner: OwnerSocket | null;
   url: string;
   timer: NodeJS.Timeout | null;
 }
 
-interface DialogWait {
+/** Dialogs are told apart by kind, text and the origin of the frame showing them. */
+interface DialogKey {
   type: string;
   message: string;
+  origin: string;
+}
+
+interface DialogWait extends DialogKey {
   event: IpcMainEvent;
   timer: NodeJS.Timeout;
 }
@@ -150,9 +159,12 @@ interface Replica {
   ownerUrl: string;
   ownerSockets: Map<string, OwnerSocket>;
   copySockets: Map<string, CopySocket>;
-  /** Dialogs of the copy's page waiting for the owner's answer, and answers that came first. */
+  /** Dialogs of the copy's page waiting for the owner's answer, the owner's open dialogs, and answers that came first. */
   dialogWaits: DialogWait[];
-  dialogAnswers: Array<{ type: string; message: string; accept: boolean; value: string | null; at: number }>;
+  ownerDialogs: DialogKey[];
+  dialogAnswers: Array<DialogKey & { accept: boolean; value: string | null; at: number }>;
+  /** While the owner's field values are put into the copy's page; what the page sends then is held. */
+  restoringUntil: number;
 }
 
 /** One sync connection per machine. */
@@ -363,7 +375,9 @@ export class ReplicaManager extends EventEmitter {
       ownerSockets: new Map(),
       copySockets: new Map(),
       dialogWaits: [],
+      ownerDialogs: [],
       dialogAnswers: [],
+      restoringUntil: 0,
     };
     this.replicas.set(key(hostId, tabId), replica);
     this.byContents.set(replica.wcId, replica);
@@ -544,7 +558,7 @@ export class ReplicaManager extends EventEmitter {
         replica.seq = msg.state.seq;
         replica.lastAckSeq = msg.state.seq;
         this.letGo(replica);
-        for (const socket of msg.sockets) replica.ownerSockets.set(socket.id, { url: socket.url, frames: socket.frames, bytes: 0, copy: null });
+        for (const socket of msg.sockets) replica.ownerSockets.set(socket.id, { url: socket.url, origin: socket.origin, frames: socket.frames, bytes: 0, copy: null });
         this.enqueue(replica, () => this.applySnapshot(replica, msg.state, msg.cookies));
         return;
       case 'state':
@@ -597,6 +611,7 @@ export class ReplicaManager extends EventEmitter {
     for (const [id, copy] of replica.copySockets) this.dropCopySocket(replica, id, copy, true);
     replica.ownerSockets.clear();
     for (const wait of [...replica.dialogWaits]) this.answerDialog(replica, wait, false, null);
+    replica.ownerDialogs = [];
     replica.dialogAnswers = [];
   }
 
@@ -653,7 +668,9 @@ export class ReplicaManager extends EventEmitter {
   }
 
   private hold(replica: Replica, request: Omit<HeldRequest, 'at' | 'owner' | 'timer'>, owner: OwnerRequest | null) {
-    const held: HeldRequest = { ...request, at: Date.now(), owner: null, timer: setTimeout(() => this.release(replica, held), ANSWER_WAIT_MS) };
+    // What the page sends because the owner's values were put into it has no counterpart there.
+    const wait = Date.now() < replica.restoringUntil ? KEY_MATCH_DELAY_MS * 2 : ANSWER_WAIT_MS;
+    const held: HeldRequest = { ...request, at: Date.now(), owner: null, timer: setTimeout(() => this.release(replica, held), wait) };
     replica.held.push(held);
     if (owner) return this.bind(replica, held, owner);
     this.match(replica);
@@ -756,31 +773,38 @@ export class ReplicaManager extends EventEmitter {
       event.returnValue = d.type === 'confirm' ? false : null;
       return;
     }
+    const key: DialogKey = { type: d.type, message: d.message, origin: event.senderFrame?.origin ?? 'null' };
     const now = Date.now();
     replica.dialogAnswers = replica.dialogAnswers.filter((a) => now - a.at < 30000);
-    const i = replica.dialogAnswers.findIndex((a) => a.type === d.type && a.message === d.message);
+    const i = replica.dialogAnswers.findIndex((a) => sameDialog(a, key));
     if (i >= 0) {
       const [answer] = replica.dialogAnswers.splice(i, 1);
       event.returnValue = d.type === 'confirm' ? answer.accept : answer.accept ? (answer.value ?? '') : null;
       return;
     }
-    const wait: DialogWait = { type: d.type, message: d.message, event, timer: setTimeout(() => this.dialogUnanswered(replica, wait), DIALOG_WAIT_MS) };
+    // The same dialog already showing on the owner: someone is answering it there, however long it takes.
+    const showing = replica.ownerDialogs.some((o) => sameDialog(o, key));
+    const wait: DialogWait = { ...key, event, timer: setTimeout(() => this.dialogUnanswered(replica, wait), showing ? RESPONSE_WAIT_MS : DIALOG_WAIT_MS) };
     replica.dialogWaits.push(wait);
   }
 
   private onOwnerDialog(replica: Replica, msg: Extract<SyncHostMessage, { t: 'dialog' }>) {
     if (msg.type !== 'confirm' && msg.type !== 'prompt') return;
-    const wait = replica.dialogWaits.find((w) => w.type === msg.type && w.message === msg.message) ?? replica.dialogWaits.find((w) => w.type === msg.type);
+    const key: DialogKey = { type: msg.type, message: msg.message, origin: originOf(msg.url) || 'null' };
+    const wait = replica.dialogWaits.find((w) => sameDialog(w, key));
     if (msg.open) {
-      // Someone is answering it there: wait for that as long as it takes.
+      replica.ownerDialogs.push(key);
+      if (replica.ownerDialogs.length > 10) replica.ownerDialogs.shift();
       if (wait) {
         clearTimeout(wait.timer);
         wait.timer = setTimeout(() => this.dialogUnanswered(replica, wait), RESPONSE_WAIT_MS);
       }
       return;
     }
+    const showing = replica.ownerDialogs.findIndex((o) => sameDialog(o, key));
+    if (showing >= 0) replica.ownerDialogs.splice(showing, 1);
     if (wait) return this.answerDialog(replica, wait, !!msg.accept, msg.value ?? null);
-    replica.dialogAnswers.push({ type: msg.type, message: msg.message, accept: !!msg.accept, value: msg.value ?? null, at: Date.now() });
+    replica.dialogAnswers.push({ ...key, accept: !!msg.accept, value: msg.value ?? null, at: Date.now() });
     if (replica.dialogAnswers.length > 10) replica.dialogAnswers.shift();
   }
 
@@ -813,15 +837,15 @@ export class ReplicaManager extends EventEmitter {
       if (copy) this.dropCopySocket(replica, id, copy, false);
       return;
     }
-    const copy: CopySocket = { sid: msg.sid, frame, owner: null, url: msg.url, timer: null };
+    const copy: CopySocket = { sid: msg.sid, frame, origin: frame.origin, owner: null, url: msg.url, timer: null };
     replica.copySockets.set(id, copy);
     if (this.bindSocket(replica, copy)) return;
     copy.timer = setTimeout(() => this.dropCopySocket(replica, id, copy, true), SOCKET_WAIT_MS);
   }
 
-  /** Connects a copy's socket to the owner's socket to the same address (one each). */
+  /** Connects a copy's socket to the owner's socket to the same address, opened by the same origin (one each). */
   private bindSocket(replica: Replica, copy: CopySocket) {
-    const free = [...replica.ownerSockets.values()].filter((o) => !o.copy);
+    const free = [...replica.ownerSockets.values()].filter((o) => !o.copy && o.origin === copy.origin && copy.origin !== 'null');
     const owner = free.find((o) => o.url === copy.url) ?? free.find((o) => sameEndpoint(o.url, copy.url));
     if (!owner) return false;
     owner.copy = copy;
@@ -851,7 +875,7 @@ export class ReplicaManager extends EventEmitter {
 
   private onOwnerSocket(replica: Replica, msg: Extract<SyncHostMessage, { t: 'socket' }>) {
     if (msg.event === 'open') {
-      replica.ownerSockets.set(msg.id, { url: msg.url, frames: [], bytes: 0, copy: null });
+      replica.ownerSockets.set(msg.id, { url: msg.url, origin: msg.origin, frames: [], bytes: 0, copy: null });
       for (const copy of replica.copySockets.values()) if (!copy.owner) this.bindSocket(replica, copy);
       return;
     }
@@ -924,10 +948,11 @@ export class ReplicaManager extends EventEmitter {
     let applied = this.indexedDBApplied.get(replica.hostId);
     if (!applied) this.indexedDBApplied.set(replica.hostId, (applied = new Map()));
     if (applied.get(origin) === latest.json) return false;
-    applied.set(origin, latest.json);
     await this.load(replica, () => replica.wc.loadURL(`${origin}${SEED_PATH}`));
     if (replica.wc.isDestroyed() || originOf(replica.wc.getURL()) !== origin) return true;
-    await replica.wc.mainFrame.executeJavaScript(`(${IDB_OP})('restore', ${JSON.stringify(latest.dump)})`).catch(() => {});
+    // Recorded only once every database is written, so the next load tries again otherwise.
+    const done = await replica.wc.mainFrame.executeJavaScript(`(${IDB_OP})('restore', ${JSON.stringify(latest.dump)})`).catch(() => false);
+    if (done === true) applied.set(origin, latest.json);
     return true;
   }
 
@@ -1019,6 +1044,11 @@ export class ReplicaManager extends EventEmitter {
         skipped = true;
         continue;
       }
+      const current = (await this.run(replica, frame, 'read', field.target)) as Pick<SyncField, 'value' | 'checked' | 'values'> | null;
+      if (!current || sameField(current, field)) continue;
+      // The page reacts to the new value (an autosave, say): that was the owner's to send, and it did.
+      replica.lastActionAt = Date.now();
+      replica.restoringUntil = Date.now() + 1000;
       if (field.checked !== undefined) await this.run(replica, frame, 'setChecked', field.target, field.checked);
       else if (field.values) await this.run(replica, frame, 'select', field.target, field.values);
       else if (field.value !== undefined) await this.run(replica, frame, 'setValue', field.target, field.value);
@@ -1181,6 +1211,16 @@ function inputModifiers(modifiers: Modifier[]) {
 
 function key(hostId: string, tabId: string) {
   return `${hostId}/${tabId}`;
+}
+
+function sameDialog(a: DialogKey, b: DialogKey) {
+  return a.type === b.type && a.message === b.message && a.origin === b.origin;
+}
+
+function sameField(current: Pick<SyncField, 'value' | 'checked' | 'values'>, field: Pick<SyncField, 'value' | 'checked' | 'values'>) {
+  if (field.checked !== undefined) return current.checked === field.checked;
+  if (field.values) return !!current.values && current.values.length === field.values.length && current.values.every((v) => field.values!.includes(v));
+  return current.value === field.value;
 }
 
 function sameOrigin(url: string, origin: string) {

@@ -36,7 +36,7 @@ interface TabRecord {
   console: ConsoleEntry[];
   fileChooser: FileChooser | null;
   /** Open WebSockets of the page, with their first frames (synced copies get what they receive). */
-  sockets: Map<string, { url: string; frames: SocketFrame[]; bytes: number }>;
+  sockets: Map<string, { url: string; origin: string; frames: SocketFrame[]; bytes: number }>;
 }
 
 interface PersistedTabs {
@@ -692,30 +692,59 @@ export class BrowserManager extends EventEmitter {
       this.changed();
       this.emit('dialog', { tabId: tab.id, threadId: tab.threadId, dialog: dialogInfo(dialog) });
     });
-    page.on('websocket', (ws) => {
-      const id = `${++this.socketSeq}`;
-      const socket = { url: ws.url(), frames: [] as SocketFrame[], bytes: 0 };
-      tab.sockets.set(id, socket);
-      this.emit('socket', { tabId: tab.id, id, event: 'open', url: socket.url });
-      ws.on('framereceived', ({ payload }) => {
-        if (!tab.sockets.has(id)) return;
-        const frame: SocketFrame = typeof payload === 'string' ? { data: payload } : { data: payload.toString('base64'), binary: true };
-        if (socket.frames.length < SOCKET_HANDSHAKE_FRAMES && socket.bytes + frame.data.length <= SOCKET_HANDSHAKE_BYTES) {
-          socket.frames.push(frame);
-          socket.bytes += frame.data.length;
-        }
-        this.emit('socket', { tabId: tab.id, id, event: 'message', ...frame });
-      });
-      const closed = () => {
-        if (tab.sockets.delete(id)) this.emit('socket', { tabId: tab.id, id, event: 'close' });
-      };
-      ws.on('close', closed);
-      ws.on('socketerror', closed);
-    });
+    void this.watchSockets(tab, page);
     // A streamed tab needs the watching client to pick files; the app shows its own picker otherwise.
     this.syncFileChooser(tab);
     page.on('download', (download) => void this.onDownload(tab, download));
     void refresh();
+  }
+
+  /**
+   * Keeps track of the page's WebSockets from the start (synced copies get what they receive). The
+   * origin of the document that opened each one comes from its handshake, so only frames of that
+   * origin in a copy get its messages.
+   */
+  private async watchSockets(tab: TabRecord, page: Page) {
+    const context = this.context;
+    if (!context) return;
+    const cdp = await context.newCDPSession(page).catch(() => null);
+    if (!cdp) return;
+    if (tab.page !== page || page.isClosed()) return void cdp.detach().catch(() => {});
+    page.once('close', () => void cdp.detach().catch(() => {}));
+    const on = cdp.on.bind(cdp) as (event: string, fn: (e: any) => void) => void;
+    // DevTools request id → the socket's id here (unique across pages and restarts of the page).
+    const ids = new Map<string, string>();
+    const created = new Map<string, string>();
+    on('Network.webSocketCreated', (e) => created.set(e.requestId, e.url));
+    on('Network.webSocketWillSendHandshakeRequest', (e) => {
+      const url = created.get(e.requestId);
+      created.delete(e.requestId);
+      const origin = Object.entries(e.request?.headers ?? {}).find(([name]) => name.toLowerCase() === 'origin')?.[1];
+      if (url === undefined || typeof origin !== 'string' || tab.page !== page) return;
+      const id = `${++this.socketSeq}`;
+      ids.set(e.requestId, id);
+      tab.sockets.set(id, { url, origin, frames: [], bytes: 0 });
+      this.emit('socket', { tabId: tab.id, id, event: 'open', url, origin });
+    });
+    on('Network.webSocketFrameReceived', (e) => {
+      const id = ids.get(e.requestId);
+      const socket = id ? tab.sockets.get(id) : undefined;
+      if (!id || !socket || (e.response?.opcode !== 1 && e.response?.opcode !== 2)) return;
+      const frame: SocketFrame = e.response.opcode === 1 ? { data: e.response.payloadData } : { data: e.response.payloadData, binary: true };
+      if (socket.frames.length < SOCKET_HANDSHAKE_FRAMES && socket.bytes + frame.data.length <= SOCKET_HANDSHAKE_BYTES) {
+        socket.frames.push(frame);
+        socket.bytes += frame.data.length;
+      }
+      this.emit('socket', { tabId: tab.id, id, event: 'message', ...frame });
+    });
+    on('Network.webSocketClosed', (e) => {
+      created.delete(e.requestId);
+      const id = ids.get(e.requestId);
+      ids.delete(e.requestId);
+      if (id && tab.sockets.delete(id)) this.emit('socket', { tabId: tab.id, id, event: 'close' });
+    });
+    // This session only listens for sockets; it keeps no response bodies of its own.
+    await cdp.send('Network.enable', { maxTotalBufferSize: 0, maxResourceBufferSize: 0 }).catch(() => {});
   }
 
   // ---------- app browser ----------

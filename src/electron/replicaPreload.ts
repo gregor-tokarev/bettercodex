@@ -3,7 +3,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 import { installSyncRecorder } from '../shared/syncPage';
 
 // The recorder lives in this isolated world: page scripts cannot see it or feed it fake actions.
-installSyncRecorder((json) => ipcRenderer.send('bc:sync-record', json), true);
+const flushTyping = installSyncRecorder((json) => ipcRenderer.send('bc:sync-record', json), true);
 
 // What the page sends right after the person does something is the other machine's to send (it
 // does the same there). This is said before the page itself sees the key or click, so even its
@@ -41,7 +41,8 @@ if (seed) {
 }
 
 // Dialogs show on the other machine when the same action arrives there; the copy's page waits for
-// the answer given there (alerts need none).
+// the answer given there (alerts need none). Typing that led to the dialog goes out first: the other
+// machine cannot open its dialog without it.
 contextBridge.executeInMainWorld({
   func: (ask: (type: string, message: string) => unknown) => {
     const define = (name: string, fn: unknown) => Object.defineProperty(window, name, { value: fn, writable: true, configurable: true });
@@ -54,7 +55,12 @@ contextBridge.executeInMainWorld({
       return typeof answer === 'string' ? answer : null;
     });
   },
-  args: [(type: string, message: string) => ipcRenderer.sendSync('bc:replica-dialog', { type, message })],
+  args: [
+    (type: string, message: string) => {
+      flushTyping();
+      return ipcRenderer.sendSync('bc:replica-dialog', { type, message });
+    },
+  ],
 });
 
 // The copy never connects to sites' WebSocket servers (what it would send there is the other
