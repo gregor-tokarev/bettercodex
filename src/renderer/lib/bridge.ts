@@ -1,5 +1,7 @@
 // Typed access to the API exposed by the Electron preload script.
 
+import type { UpdateStatus } from '../../shared/types';
+
 export interface HostEntry {
   id: string;
   name: string;
@@ -55,6 +57,13 @@ interface Bridge {
     reload(hostId: string, tabId: string): Promise<void>;
     status(hostId: string, tabId: string): Promise<ReplicaStatus | null>;
     onStatus(cb: (status: ReplicaStatus & { hostId: string; tabId: string }) => void): () => void;
+  };
+  updates: {
+    status(): Promise<UpdateStatus>;
+    check(): Promise<UpdateStatus>;
+    /** Downloads the update and restarts into it (or opens the download page when this copy cannot replace itself). */
+    install(): Promise<void>;
+    onStatus(cb: (status: UpdateStatus) => void): () => void;
   };
   onShortcut(cb: (e: { key: string; shift: boolean }) => void): () => void;
   openExternal(url: string): Promise<void>;

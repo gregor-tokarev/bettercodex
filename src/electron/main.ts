@@ -7,6 +7,7 @@ import { AppBrowser } from './appBrowser.js';
 import { HostManager, type HostEntry } from './hosts.js';
 import { ReplicaManager } from './replicas.js';
 import { ViewStage, type Rect } from './stage.js';
+import { Updater } from './updater.js';
 
 const distDir = path.resolve(__dirname, '..');
 
@@ -201,6 +202,12 @@ function boot() {
   });
   ipcMain.handle('app:info', () => ({ platform: process.platform, version: app.getVersion(), instanceId: appBrowser.instanceId }));
 
+  const updater = new Updater(userData);
+  updater.on('status', (status) => send('updates:status', status));
+  ipcMain.handle('updates:status', () => updater.status);
+  ipcMain.handle('updates:check', () => updater.check());
+  ipcMain.handle('updates:install', () => updater.install());
+
   ipcMain.handle('appBrowser:show', (e, targetId: string | null, bounds: Rect | null) => {
     const owner = BrowserWindow.fromWebContents(e.sender);
     return owner ? appBrowser.show(owner, targetId, bounds) : false;
@@ -290,6 +297,7 @@ function boot() {
       createWindow();
     }
     if (hostFromEnv) void register(hostFromEnv);
+    updater.start();
     appBrowser.ready.catch((err) => console.error('browser bridge failed to start:', err));
     app.on('activate', () => {
       if (!win) {
