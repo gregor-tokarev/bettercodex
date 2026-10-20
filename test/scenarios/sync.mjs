@@ -10,7 +10,7 @@ import { click, rootShot, type } from './x11.mjs';
 const remoteHome = process.env.REMOTE_HOME ?? '/tmp/bc-remote-userhome/.bettercodex';
 
 function site() {
-  const counts = { GET: 0, POST: 0, save: 0 };
+  const counts = { GET: 0, POST: 0, save: 0, config: 0, like: 0, login: 0 };
   const page = (cookie) => `<!doctype html><title>Sync test</title>
 <body style="margin:0;font:18px sans-serif">
 <h1 style="margin:16px">${/user=(\w+)/.exec(cookie ?? '')?.[1] ? `Hello ${/user=(\w+)/.exec(cookie)[1]}` : 'Signed out'}</h1>
@@ -19,6 +19,11 @@ function site() {
 <select id="color"><option value="r">Red</option><option value="g">Green</option></select>
 <a id="next" href="/page2" style="margin-left:12px">Next page</a>
 <button id="save" style="margin-left:12px;height:36px" onclick="fetch('/save', { method: 'POST' })">Save</button>
+<p style="margin:16px"><span id="greeting">…</span>
+<button id="like" style="margin-left:12px;height:36px" onclick="fetch('/api/like', { method: 'POST' }).then((r) => r.json()).then((j) => (document.querySelector('#likes').textContent = j.likes))">Like</button>
+<span id="likes">0</span>
+<button id="route" style="margin-left:12px;height:36px" onclick="history.pushState({}, '', '/?route=2')">Route</button></p>
+<script>fetch('/api/config', { method: 'POST' }).then((r) => r.json()).then((j) => (document.querySelector('#greeting').textContent = j.greeting));</script>
 <form method="post" action="/login" style="margin:16px"><input id="user" name="user" placeholder="user" style="width:160px;height:30px"><button id="login" style="height:36px">Sign in</button></form>
 <div style="height:2000px"></div><p id="bottom">bottom</p></body>`;
   const server = http.createServer((req, res) => {
@@ -27,8 +32,17 @@ function site() {
       counts.save++;
       return res.writeHead(204).end();
     }
+    if (req.method === 'POST' && req.url === '/api/config') {
+      counts.config++;
+      return res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ greeting: 'Welcome' }));
+    }
+    if (req.method === 'POST' && req.url === '/api/like') {
+      counts.like++;
+      return res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ likes: counts.like }));
+    }
     if (req.url === '/stats') return res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(counts));
     if (req.method === 'POST' && req.url === '/login') {
+      counts.login++;
       let body = '';
       req.on('data', (c) => (body += c));
       req.on('end', () => {
@@ -53,6 +67,25 @@ async function mcp(name, args) {
   });
   const body = await res.json();
   return body.result.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n');
+}
+
+/** Client RPC to the other machine's host (as the app would). */
+async function hostRpc(method, params) {
+  const { port, token } = JSON.parse(fs.readFileSync(`${remoteHome}/host.json`, 'utf8'));
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, ['bettercodex.v1', `auth.${token}`]);
+  await new Promise((resolve, reject) => {
+    ws.onopen = resolve;
+    ws.onerror = reject;
+  });
+  const result = await new Promise((resolve) => {
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.t === 'res' && msg.id === 1) resolve(msg.result ?? msg.error);
+    };
+    ws.send(JSON.stringify({ t: 'rpc', id: 1, method, params }));
+  });
+  ws.close();
+  return result;
 }
 
 async function until(what, fn, timeout = 15000) {
@@ -151,16 +184,38 @@ export default async function ({ win, app, shot, sleep, out }) {
     console.log('Enter on a button: saves sent', counts.save);
     if (counts.save !== 1) throw new Error(`expected exactly one save, got ${counts.save}`);
 
-    // 6. signing in from the copy: the form is posted once, by the other machine, and its cookie follows
-    const postsBefore = counts.POST;
+    // 6. a page that reads through POST loads in the copy; a POST after a click is sent once and its
+    //    answer shows up in the copy too, whether the click was made in the copy or by the agent
+    await until('the copy to load data posted at page load', async () => (await copy.textContent('#greeting')) === 'Welcome');
+    click(...(await at('#like')));
+    await until('the like to show in the copy', async () => (await copy.textContent('#likes')) === '1');
+    await sleep(1500);
+    console.log('like from the copy: sent', counts.like, '| copy shows', await copy.textContent('#likes'));
+    if (counts.like !== 1) throw new Error(`expected one like, got ${counts.like}`);
+    await mcp('click', { tabId, selector: '#like' });
+    await until('the agent like to show in the copy', async () => (await copy.textContent('#likes')) === '2');
+    await sleep(1500);
+    console.log('like by the agent: sent', counts.like, '| copy shows', await copy.textContent('#likes'));
+    if (counts.like !== 2) throw new Error(`expected two likes, got ${counts.like}`);
+
+    // 7. an in-page navigation does not leave the tab loading forever
+    click(...(await at('#route')));
+    await until('the route change to finish loading', async () => {
+      const tab = (await hostRpc('browser/tabs/list', {})).tabs.find((t) => t.id === tabId);
+      return tab?.url.endsWith('/?route=2') && tab.loading === false;
+    });
+    console.log('in-page navigation finished loading');
+
+    // 8. signing in from the copy: the form is posted once, by the other machine, and its cookie follows
+    const postsBefore = counts.login;
     click(...(await at('#user')));
     type('ada');
     await sleep(500);
     click(...(await at('#login')));
     await until('the copy to show the signed-in page', async () => copy.url() === `${base}/?welcome` && (await copy.locator('h1').textContent()) === 'Hello ada', 20000);
     await sleep(1500);
-    console.log('sign-in: POSTs sent', counts.POST - postsBefore, '| copy says', await copy.locator('h1').textContent());
-    if (counts.POST - postsBefore !== 1) throw new Error(`expected exactly one POST, got ${counts.POST - postsBefore}`);
+    console.log('sign-in: form posts sent', counts.login - postsBefore, '| copy says', await copy.locator('h1').textContent());
+    if (counts.login - postsBefore !== 1) throw new Error(`expected exactly one sign-in post, got ${counts.login - postsBefore}`);
     rootShot(out, '81-sync-signed-in');
     await shot('82-sync-ui');
   } finally {

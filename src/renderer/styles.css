@@ -263,6 +263,19 @@ body.resizing * {
   color: var(--text-muted);
 }
 
+.sidebar-button.update {
+  color: var(--blue);
+  margin-bottom: 2px;
+}
+
+.sidebar-button.update:disabled {
+  opacity: 1;
+}
+
+.sidebar-button.update:disabled:hover {
+  background: none;
+}
+
 .sidebar-search {
   display: flex;
   align-items: center;

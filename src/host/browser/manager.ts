@@ -637,6 +637,15 @@ export class BrowserManager extends EventEmitter {
       tab.url = page.url();
       tab.loading = true;
       this.changed();
+      // Single-page apps navigate within the document: no load event follows, so ask the page.
+      void Promise.race([page.evaluate(() => document.readyState), new Promise<null>((r) => setTimeout(() => r(null), 3000))])
+        .then((state) => {
+          if (state && state !== 'loading' && tab.page === page && tab.loading) {
+            tab.loading = false;
+            this.changed();
+          }
+        })
+        .catch(() => {});
     });
     page.on('domcontentloaded', () => {
       tab.loading = false;

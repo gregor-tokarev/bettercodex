@@ -33,6 +33,9 @@ The Mac app isn't notarized yet. After moving it to Applications, run this once 
 xattr -dr com.apple.quarantine /Applications/BetterCodex.app
 ```
 
+You only do this once. When a new build is out, an update button shows up at the bottom of the sidebar; one click
+installs it and restarts the app. The `.AppImage` updates the same way, while the `.deb` sends you to the download page.
+
 ## Build from source
 
 Install Node.js 20+ and the [Codex CLI](https://github.com/openai/codex). Machines you add over SSH need Node.js 20+

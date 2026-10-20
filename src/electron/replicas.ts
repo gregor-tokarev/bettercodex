@@ -4,8 +4,10 @@ import { EventEmitter } from 'node:events';
 import { WebSocket } from 'ws';
 import { WS_SUBPROTOCOL } from '../shared/types.js';
 import {
+  ACTION_WINDOW_MS,
   echoKey,
   onlyReachableThere,
+  requestKey,
   sameDocument,
   syncPageOp,
   type FrameRef,
@@ -14,6 +16,7 @@ import {
   type SyncClientMessage,
   type SyncCookie,
   type SyncHostMessage,
+  type SyncResponse,
   type SyncState,
 } from '../shared/syncPage.js';
 import type { HostManager } from './hosts.js';
@@ -27,6 +30,8 @@ const MAX_REPLICAS = 8;
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 /** While the person types or scrolls in a copy, the other machine's state does not overwrite it. */
 const QUIET_MS = 1500;
+/** How long a copy's request waits for the owner's answer before it fails. */
+const ANSWER_WAIT_MS = 30000;
 
 export type ReplicaStatus = 'connecting' | 'loading' | 'synced' | 'syncing' | 'offline' | 'gone';
 
@@ -67,6 +72,13 @@ interface Replica {
   lastShown: number;
   /** Snapshots, states and actions from the owner are applied one after another, in order. */
   work: Promise<void>;
+  /** Last action here or replayed from the owner; data sent soon after it is the owner's to send. */
+  lastActionAt: number;
+  /** Requests waiting for the owner's answer, and answers that came before the request. */
+  waiting: Array<{ key: string; requestId: string; sessionId?: string; timer: NodeJS.Timeout }>;
+  answers: Array<SyncResponse & { at: number }>;
+  /** When the copy last got one of the owner's answers (its page then saw the same result). */
+  lastAnsweredAt: number;
   snapshotted: boolean;
 }
 
@@ -253,12 +265,17 @@ export class ReplicaManager extends EventEmitter {
       lastLocalInput: 0,
       lastShown: Date.now(),
       work: Promise.resolve(),
+      lastActionAt: 0,
+      waiting: [],
+      answers: [],
+      lastAnsweredAt: 0,
       snapshotted: false,
     };
     this.replicas.set(key(hostId, tabId), replica);
     this.byContents.set(replica.wcId, replica);
     this.stage.add(replica);
     this.wire(replica);
+    this.intercept(replica);
     const link = this.link(hostId);
     link.replicas.set(tabId, replica);
     this.subscribe(replica);
@@ -301,6 +318,7 @@ export class ReplicaManager extends EventEmitter {
     }
     if (replica.refreshTimer) clearTimeout(replica.refreshTimer);
     if (replica.reconcileTimer) clearTimeout(replica.reconcileTimer);
+    for (const w of replica.waiting) clearTimeout(w.timer);
     if (!replica.wc.isDestroyed()) replica.wc.close();
   }
 
@@ -311,10 +329,12 @@ export class ReplicaManager extends EventEmitter {
     if (this.sessions.has(partition)) return ses;
     this.sessions.add(partition);
     ses.setUserAgent(ses.getUserAgent().replace(/\s(Electron|BetterCodex|bettercodex)\/\S+/g, ''));
-    // A copy only reads. Anything that sends data (forms, API writes, sockets) happens on the owner.
+    // Pages load like anywhere else (many read through POST APIs). Data sent right after an action
+    // is answered by the owner (see intercept); form posts and sockets only ever run on the owner.
     ses.webRequest.onBeforeRequest((details, callback) => {
-      const unsafe = !SAFE_METHODS.has(details.method) || details.resourceType === 'webSocket' || /^wss?:/i.test(details.url);
-      callback({ cancel: unsafe });
+      const socket = details.resourceType === 'webSocket' || /^wss?:/i.test(details.url);
+      const formPost = !SAFE_METHODS.has(details.method) && (details.resourceType === 'mainFrame' || details.resourceType === 'subFrame');
+      callback({ cancel: socket || formPost });
     });
     ses.on('will-download', (_event, item) => item.cancel());
     ses.setPermissionRequestHandler((_wc, permission, callback) => callback(permission === 'clipboard-sanitized-write' || permission === 'fullscreen'));
@@ -385,6 +405,7 @@ export class ReplicaManager extends EventEmitter {
       return;
     }
     replica.lastLocalInput = now;
+    replica.lastActionAt = now;
     const id = crypto.randomUUID();
     replica.pending.set(id, action);
     if (this.link(replica.hostId).send({ t: 'action', tabId: replica.tabId, id, action })) this.setStatus(replica, 'syncing');
@@ -421,6 +442,7 @@ export class ReplicaManager extends EventEmitter {
         this.enqueue(replica, () => this.replay(replica, msg.action));
         return;
       case 'ack':
+        if (msg.error) debug('the owner could not replay an action:', msg.error);
         replica.pending.delete(msg.id);
         replica.lastAckSeq = Math.max(replica.lastAckSeq, msg.seq);
         replica.seq = Math.max(replica.seq, msg.seq);
@@ -430,7 +452,94 @@ export class ReplicaManager extends EventEmitter {
         this.setStatus(replica, 'gone', msg.error ?? null);
         if (msg.error === 'The tab was closed') this.destroy(replica);
         return;
+      case 'response':
+        this.onAnswer(replica, msg);
+        return;
     }
+  }
+
+  // ---------- requests that send data ----------
+
+  /**
+   * The copy's XHR/fetch requests pass through here (all frames). Requests that send data right
+   * after an action are not sent: the owner sends them when it replays the action, and its answer
+   * is given to the copy. Everything else goes to the network as usual.
+   */
+  private intercept(replica: Replica) {
+    const dbg = replica.wc.debugger;
+    try {
+      dbg.attach('1.3');
+    } catch {
+      return;
+    }
+    const patterns = [
+      { resourceType: 'XHR', requestStage: 'Request' },
+      { resourceType: 'Fetch', requestStage: 'Request' },
+    ];
+    const send = (method: string, params: object, sessionId?: string) => dbg.sendCommand(method, params, sessionId).catch(() => {});
+    dbg.on('message', (_event, method, params, sessionId) => {
+      if (method === 'Fetch.requestPaused') this.onRequest(replica, params, sessionId || undefined);
+      else if (method === 'Target.attachedToTarget') {
+        // Frames of other sites run in their own processes: intercept there too, then let them start.
+        void send('Fetch.enable', { patterns }, params.sessionId).then(() => send('Runtime.runIfWaitingForDebugger', {}, params.sessionId));
+      }
+    });
+    void send('Fetch.enable', { patterns });
+    void send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
+  }
+
+  private onRequest(replica: Replica, params: { requestId: string; request: { method: string; url: string } }, sessionId?: string) {
+    const dbg = replica.wc.debugger;
+    const { requestId, request } = params;
+    if (SAFE_METHODS.has(request.method) || Date.now() - replica.lastActionAt > ACTION_WINDOW_MS) {
+      void dbg.sendCommand('Fetch.continueRequest', { requestId }, sessionId).catch(() => {});
+      return;
+    }
+    const key = requestKey(request.method, request.url);
+    const now = Date.now();
+    replica.answers = replica.answers.filter((a) => now - a.at < ANSWER_WAIT_MS);
+    const ready = replica.answers.findIndex((a) => a.key === key);
+    if (ready >= 0) {
+      const [answer] = replica.answers.splice(ready, 1);
+      this.answer(replica, requestId, sessionId, answer);
+      return;
+    }
+    debug('waiting for the owner to answer', key);
+    const timer = setTimeout(() => {
+      replica.waiting = replica.waiting.filter((w) => w.requestId !== requestId);
+      void dbg.sendCommand('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' }, sessionId).catch(() => {});
+    }, ANSWER_WAIT_MS);
+    replica.waiting.push({ key, requestId, sessionId, timer });
+  }
+
+  private onAnswer(replica: Replica, answer: SyncResponse) {
+    const i = replica.waiting.findIndex((w) => w.key === answer.key);
+    if (i < 0) {
+      replica.answers.push({ ...answer, at: Date.now() });
+      if (replica.answers.length > 100) replica.answers.shift();
+      return;
+    }
+    const [waiting] = replica.waiting.splice(i, 1);
+    clearTimeout(waiting.timer);
+    this.answer(replica, waiting.requestId, waiting.sessionId, answer);
+  }
+
+  private answer(replica: Replica, requestId: string, sessionId: string | undefined, answer: SyncResponse) {
+    debug('answered from the owner', answer.key, answer.status);
+    replica.lastAnsweredAt = Date.now();
+    const dbg = replica.wc.debugger;
+    if (replica.wc.isDestroyed()) return;
+    if (answer.failed) {
+      void dbg.sendCommand('Fetch.failRequest', { requestId, errorReason: 'Failed' }, sessionId).catch(() => {});
+      return;
+    }
+    void dbg
+      .sendCommand(
+        'Fetch.fulfillRequest',
+        { requestId, responseCode: answer.status, ...(answer.statusText ? { responsePhrase: answer.statusText } : {}), responseHeaders: answer.headers, body: answer.body },
+        sessionId,
+      )
+      .catch(() => {});
   }
 
   /** That machine's own servers and files are not this machine's: such pages are streamed instead. */
@@ -493,7 +602,8 @@ export class ReplicaManager extends EventEmitter {
   private async applyState(replica: Replica, state: SyncState) {
     if (replica.wc.isDestroyed() || !replica.snapshotted) return;
     replica.lastState = state;
-    if (state.mutated) replica.needsRefresh = true;
+    // When the copy's page got the owner's answers it already shows the result; otherwise refetch.
+    if (state.mutated && Date.now() - replica.lastAnsweredAt > ACTION_WINDOW_MS + 5000) replica.needsRefresh = true;
     if (state.storage) this.rememberStorage(replica, state.storage);
     if (this.unreachable(replica, state.url)) {
       replica.nav = state.nav;
@@ -609,6 +719,7 @@ export class ReplicaManager extends EventEmitter {
 
   /** Does here what was done on the owning machine (only on the page it was done on). */
   private async replay(replica: Replica, action: SyncAction) {
+    replica.lastActionAt = Date.now();
     await this.loaded(replica);
     if (replica.wc.isDestroyed()) return;
     const frame = this.frameFor(replica.wc, action.frame);
