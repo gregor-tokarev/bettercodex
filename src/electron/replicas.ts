@@ -438,11 +438,16 @@ export class ReplicaManager extends EventEmitter {
     this.sessions.add(partition);
     ses.setUserAgent(ses.getUserAgent().replace(/\s(Electron|BetterCodex|bettercodex)\/\S+/g, ''));
     // Pages load like anywhere else (many read through POST APIs). Data sent right after an action
-    // is answered by the owner (see intercept); form posts and sockets only ever run on the owner
-    // (the copy's pages get the owner's sockets relayed instead, see onCopySocket).
+    // is answered by the owner (see intercept); sockets, top-level form posts and frames posted to
+    // right after an action only ever run on the owner (the copy's pages get the owner's sockets
+    // relayed instead, see onCopySocket). Frames a page posts to on its own while loading (embedded
+    // apps that sign in that way) load like its other requests.
     ses.webRequest.onBeforeRequest((details, callback) => {
       const socket = details.resourceType === 'webSocket' || /^wss?:/i.test(details.url);
-      const formPost = !SAFE_METHODS.has(details.method) && (details.resourceType === 'mainFrame' || details.resourceType === 'subFrame');
+      const replica = details.webContentsId === undefined ? undefined : this.byContents.get(details.webContentsId);
+      const afterAction = !replica || Date.now() - replica.lastActionAt <= ACTION_WINDOW_MS;
+      const formPost = !SAFE_METHODS.has(details.method) && (details.resourceType === 'mainFrame' || (details.resourceType === 'subFrame' && afterAction));
+      if (formPost) debug('form post left to the owner', details.resourceType, details.url);
       callback({ cancel: socket || formPost });
     });
     ses.on('will-download', (_event, item) => item.cancel());
@@ -558,7 +563,7 @@ export class ReplicaManager extends EventEmitter {
         replica.seq = msg.state.seq;
         replica.lastAckSeq = msg.state.seq;
         this.letGo(replica);
-        for (const socket of msg.sockets) replica.ownerSockets.set(socket.id, { url: socket.url, origin: socket.origin, frames: socket.frames, bytes: 0, copy: null });
+        for (const socket of msg.sockets ?? []) replica.ownerSockets.set(socket.id, { url: socket.url, origin: socket.origin, frames: socket.frames, bytes: 0, copy: null });
         this.enqueue(replica, () => this.applySnapshot(replica, msg.state, msg.cookies));
         return;
       case 'state':
@@ -638,13 +643,14 @@ export class ReplicaManager extends EventEmitter {
     const send = (method: string, params: object, sessionId?: string) => dbg.sendCommand(method, params, sessionId).catch(() => {});
     dbg.on('message', (_event, method, params, sessionId) => {
       if (method === 'Fetch.requestPaused') this.onRequest(replica, params, sessionId || undefined);
-      else if (method === 'Target.attachedToTarget') {
-        // Frames of other sites run in their own processes: intercept there too, then let them start.
-        void send('Fetch.enable', { patterns }, params.sessionId).then(() => send('Runtime.runIfWaitingForDebugger', {}, params.sessionId));
-      }
+      // Frames of other sites run in their own processes: intercept there too.
+      else if (method === 'Target.attachedToTarget') void send('Fetch.enable', { patterns }, params.sessionId);
     });
     void send('Fetch.enable', { patterns });
-    void send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
+    // Such frames are not held until then: Electron never lets a frame held for the debugger go on,
+    // so it would never load (and neither would its page). Their navigations, form posts included,
+    // are intercepted here anyway.
+    void send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
   }
 
   private onRequest(replica: Replica, params: { requestId: string; resourceType: string; request: PausedRequest }, sessionId?: string) {
