@@ -19,6 +19,7 @@ import {
 import { CodexBridge, RpcError, TIMEOUT } from './codex.js';
 import { loadConfig, paths, readJson, saveConfig, writeJson } from './config.js';
 import { errorMessage, log } from './log.js';
+import { FIND_IN_PAGE } from './browser/find.js';
 import { BrowserManager } from './browser/manager.js';
 import { StreamHub } from './browser/stream.js';
 import { SyncHub } from './browser/sync.js';
@@ -301,8 +302,8 @@ export class HostServer {
   /**
    * Stops the turn running in a thread. The app's idea of which turn runs can be out of date (an
    * event missed while reconnecting, a turn started by a scheduled task), so whatever turn Codex
-   * reports as running is the one stopped. `idle` means nothing was running at all, which lets the
-   * app drop a "working" state that no longer matches Codex.
+   * reports as running is the one stopped (`turnId`). `idle` means nothing was running at all, which
+   * lets the app drop a "working" state that no longer matches Codex.
    */
   private async interrupt(params: { threadId: string; turnId?: string }) {
     let turnId = params.turnId ?? '';
@@ -310,7 +311,7 @@ export class HostServer {
       try {
         // Codex answers once the turn has actually stopped; a turn that ended meanwhile gets no answer.
         await this.codex.request('turn/interrupt', { threadId: params.threadId, turnId }, 10_000);
-        return { idle: false };
+        return { idle: false, turnId };
       } catch (err) {
         const message = errorMessage(err);
         const running = /but found (\S+)/.exec(message)?.[1];
@@ -321,7 +322,7 @@ export class HostServer {
         if (/no active turn|thread not found|not loaded/i.test(message)) return { idle: true };
         if ((err as RpcError).code !== TIMEOUT) throw err;
         const res = await this.codex.request('thread/read', { threadId: params.threadId }).catch(() => null);
-        return { idle: res?.thread?.status?.type !== 'active' };
+        return { idle: res?.thread?.status?.type !== 'active', turnId };
       }
     }
     throw new RpcError(-32000, 'The running turn kept changing; try again');
@@ -484,6 +485,12 @@ export class HostServer {
         // Navigation can take a while; answer right away and let tab events report progress.
         run().catch((err) => log.warn('navigate', errorMessage(err)));
         return {};
+      }
+      case 'browser/tabs/find': {
+        // Streamed tabs only: the app finds in the pages it renders itself.
+        if (!b.get(params.tabId)) throw new RpcError(-32602, 'no such tab');
+        const page = await b.page(params.tabId);
+        return page.evaluate(FIND_IN_PAGE, { text: String(params.text ?? ''), forward: params.forward !== false, again: !!params.again });
       }
       case 'browser/dialog/respond':
         await b.handleDialog(params.tabId, !!params.accept, params.promptText);

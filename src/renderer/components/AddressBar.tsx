@@ -48,7 +48,8 @@ export function AddressBar({
   const [entry, setEntry] = useState<Entry>({ typed: '', completed: null });
   const [value, setValue] = useState('');
   const [open, setOpen] = useState(false);
-  const [highlight, setHighlight] = useState(0);
+  /** The suggestion picked with the arrow keys; Enter opens it even if the list changes meanwhile. */
+  const [picked, setPicked] = useState<Item | null>(null);
   const [remote, setRemote] = useState<{ for: string; s: Suggestions } | null>(null);
   const shown = url === 'about:blank' ? '' : url;
 
@@ -92,12 +93,13 @@ export function AddressBar({
   // Suggestions for an earlier part of the typed text stay until the new ones arrive.
   const typedNow = entry.typed.trim().toLowerCase();
   const items = suggestionsFor(entry, remote && typedNow.startsWith(remote.for.toLowerCase()) ? remote.s : null);
-  const active = open && items.length ? Math.min(highlight, items.length - 1) : -1;
+  // Without a pick, the first suggestion is what Enter does.
+  const active = !open || !items.length ? -1 : picked ? items.findIndex((i) => i.kind === picked.kind && i.url === picked.url) : 0;
 
   const reset = () => {
     setEntry({ typed: '', completed: null });
     setOpen(false);
-    setHighlight(0);
+    setPicked(null);
   };
 
   const go = (item: Item | null) => {
@@ -115,7 +117,7 @@ export function AddressBar({
     const done = inserting ? completion(text) : null;
     setEntry({ typed: text, completed: done });
     setValue(done ? done.text : text);
-    setHighlight(0);
+    setPicked(null);
     setOpen(true);
   };
 
@@ -124,7 +126,7 @@ export function AddressBar({
       className="url-form"
       onSubmit={(e) => {
         e.preventDefault();
-        go(active >= 0 ? items[active] : null);
+        go(picked ?? (active >= 0 ? items[active] : null));
       }}
     >
       <input
@@ -153,10 +155,9 @@ export function AddressBar({
           if (e.nativeEvent.isComposing) return;
           if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && open && items.length) {
             e.preventDefault();
-            const next = (active + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
-            setHighlight(next);
+            const next = (Math.max(active, 0) + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+            setPicked(items[next]);
             setValue(items[next].fill);
-            setEntry((cur) => ({ ...cur, completed: null }));
           } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && /^[\w-]+$/.test(entry.typed.trim())) {
             // Ctrl+Enter: "github" → www.github.com
             e.preventDefault();
@@ -181,7 +182,6 @@ export function AddressBar({
               type="button"
               key={`${item.kind}:${item.url}`}
               className={`omnibox-item ${i === active ? 'active' : ''}`}
-              onMouseEnter={() => setHighlight(i)}
               onClick={() => go(item)}
             >
               <span className="omnibox-icon">

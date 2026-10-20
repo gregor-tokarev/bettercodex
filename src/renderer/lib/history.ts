@@ -147,11 +147,20 @@ export function completion(typed: string): { text: string; url: string } | null 
       if (displayUrl(v.url).toLowerCase().startsWith(bare) && (!best || score(v) > score(best))) best = v;
     }
     if (!best) return null;
-    return { text: typed + displayUrl(best.url).slice(bare.length), url: best.url };
+    return { text: typed + displayUrl(best.url).slice(bare.length), url: asTyped(best.url, scheme, www) };
   }
   const site = sites().find((s) => s.host.startsWith(bare));
   if (!site) return null;
-  return { text: typed + site.host.slice(bare.length), url: site.url };
+  return { text: typed + site.host.slice(bare.length), url: asTyped(site.url, scheme, www) };
+}
+
+/** A remembered address with the scheme and "www." the person typed, when they typed them. */
+function asTyped(url: string, scheme: string, www: string) {
+  if (!scheme && !www) return url;
+  const u = new URL(url);
+  if (scheme) u.protocol = scheme.slice(0, -2);
+  if (www && !u.hostname.startsWith('www.')) u.hostname = `www.${u.hostname}`;
+  return u.toString();
 }
 
 /** Visited pages whose address or title has every typed word, best first. */

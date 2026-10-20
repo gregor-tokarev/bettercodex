@@ -28,9 +28,6 @@ export interface KeyPress {
   shift: boolean;
 }
 
-/** Actions about the tab list and the address bar; the others act on the page itself. */
-export const PANEL_ACTIONS = new Set<BrowserAction['type']>(['focusAddress', 'newTab', 'closeTab', 'reopenTab', 'nextTab', 'prevTab', 'selectTab', 'find', 'findNext']);
-
 /** The latin letter or digit of a key, also on other keyboard layouts (Ctrl+Е is Ctrl+T). */
 export function shortcutKey(k: Pick<KeyPress, 'key' | 'code'>) {
   if (/^[a-z0-9]$/i.test(k.key)) return k.key.toLowerCase();

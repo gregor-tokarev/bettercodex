@@ -1553,6 +1553,10 @@ body.resizing * {
   white-space: nowrap;
 }
 
+.omnibox-item:hover {
+  background: var(--bg-hover);
+}
+
 .omnibox-item.active {
   background: var(--bg-active);
 }

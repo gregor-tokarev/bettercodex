@@ -165,8 +165,8 @@ interface Replica {
   dialogAnswers: Array<DialogKey & { accept: boolean; value: string | null; at: number }>;
   /** While the owner's field values are put into the copy's page; what the page sends then is held. */
   restoringUntil: number;
-  /** Until when key presses are the owner's being replayed here, not the person's shortcuts. */
-  syntheticUntil: number;
+  /** Set while the owner's key presses are replayed here; they are not the person's shortcuts. */
+  replayingKeys: boolean;
 }
 
 /** One sync connection per machine. */
@@ -390,7 +390,7 @@ export class ReplicaManager extends EventEmitter {
       ownerDialogs: [],
       dialogAnswers: [],
       restoringUntil: 0,
-      syntheticUntil: 0,
+      replayingKeys: false,
     };
     this.replicas.set(key(hostId, tabId), replica);
     this.byContents.set(replica.wcId, replica);
@@ -475,7 +475,6 @@ export class ReplicaManager extends EventEmitter {
       back: () => send('back'),
       forward: () => send('forward'),
       reload: () => send('reload'),
-      stop: () => replica.wc.stop(),
       canGoBack: () => true,
       canGoForward: () => true,
     };
@@ -488,7 +487,7 @@ export class ReplicaManager extends EventEmitter {
     wc.setWindowOpenHandler(() => ({ action: 'deny' }));
     wc.on('will-prevent-unload', (event) => event.preventDefault());
     wc.on('context-menu', (_e, params) => showPageMenu(wc, params, this.uiWindow(), nav, { newTab: false }));
-    wc.on('before-input-event', (event, input) => handlePageKeys(event, input, this.uiWindow(), nav, wc, () => Date.now() < replica.syntheticUntil));
+    wc.on('before-input-event', (event, input) => handlePageKeys(event, input, this.uiWindow(), nav, wc, () => replica.replayingKeys));
     wc.on('found-in-page', (_e, result) => this.uiWindow()?.webContents.send('pageView:found', result));
     wc.on('did-start-loading', () => {
       replica.loading = true;
@@ -1189,10 +1188,15 @@ export class ReplicaManager extends EventEmitter {
         const keyCode = KEY_CODES[action.key] ?? action.key;
         const modifiers = inputModifiers(action.modifiers);
         expectEcho(action);
-        replica.syntheticUntil = Date.now() + 500;
-        wc.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
-        if (action.key === 'Enter' || action.key === 'Space') wc.sendInputEvent({ type: 'char', keyCode: action.key === 'Enter' ? '\r' : ' ', modifiers });
-        wc.sendInputEvent({ type: 'keyUp', keyCode, modifiers });
+        // Electron reports these to before-input-event synchronously, so the flag marks exactly them.
+        replica.replayingKeys = true;
+        try {
+          wc.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
+          if (action.key === 'Enter' || action.key === 'Space') wc.sendInputEvent({ type: 'char', keyCode: action.key === 'Enter' ? '\r' : ' ', modifiers });
+          wc.sendInputEvent({ type: 'keyUp', keyCode, modifiers });
+        } finally {
+          replica.replayingKeys = false;
+        }
         return;
       }
       case 'scroll':

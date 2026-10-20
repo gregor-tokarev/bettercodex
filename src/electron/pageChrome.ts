@@ -1,12 +1,11 @@
 import { clipboard, Menu, shell, type BrowserWindow, type ContextMenuParams, type Input, type MenuItemConstructorOptions, type WebContents } from 'electron';
-import { browserAction, nextZoom, PANEL_ACTIONS, shortcutKey, type BrowserAction } from '../shared/browserKeys.js';
+import { browserAction, nextZoom, shortcutKey, type BrowserAction } from '../shared/browserKeys.js';
 
 /** Back/forward/reload of a page view; for a synced copy these go to the machine that owns the tab. */
 export interface PageNavigation {
   back(): void;
   forward(): void;
   reload(hard: boolean): void;
-  stop(): void;
   canGoBack(): boolean;
   canGoForward(): boolean;
 }
@@ -16,7 +15,6 @@ export function localNavigation(wc: WebContents): PageNavigation {
     back: () => wc.navigationHistory.goBack(),
     forward: () => wc.navigationHistory.goForward(),
     reload: (hard) => (hard ? wc.reloadIgnoringCache() : wc.reload()),
-    stop: () => wc.stop(),
     canGoBack: () => wc.navigationHistory.canGoBack(),
     canGoForward: () => wc.navigationHistory.canGoForward(),
   };
@@ -44,8 +42,8 @@ export function handlePageKeys(event: Electron.Event, input: Input, uiWindow: Br
   if (!action) return;
   switch (action.type) {
     case 'stop':
-      // The page gets its Esc too (closing its own popups); a loading page also stops.
-      if (wc.isLoading()) nav.stop();
+      // The panel closes its find bar and stops loading; the page gets its Esc too (closing its own popups).
+      uiWindow?.webContents.send('browser:action', action);
       return;
     case 'reload':
       nav.reload(action.hard);
@@ -61,7 +59,8 @@ export function handlePageKeys(event: Electron.Event, input: Input, uiWindow: Br
       uiWindow?.webContents.send('pageView:zoomed', { factor: wc.getZoomFactor() });
       break;
     default:
-      if (!PANEL_ACTIONS.has(action.type) || !uiWindow) return;
+      // Tabs, the address bar and find belong to the browser panel.
+      if (!uiWindow) return;
       if (TAKES_FOCUS.has(action.type)) uiWindow.webContents.focus();
       uiWindow.webContents.send('browser:action', action);
   }

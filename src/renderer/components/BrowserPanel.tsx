@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { BrowserAction } from '../../shared/browserKeys';
+import { nextZoom, type BrowserAction } from '../../shared/browserKeys';
 import type { PageViewRef, TabInfo } from '../../shared/types';
 import { handleBrowserActions } from '../lib/browserActions';
 import { bc } from '../lib/bridge';
@@ -58,10 +58,17 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
   const [find, setFind] = useState<FindState>({ open: false, text: '', matches: 0, active: 0 });
   /** Bumped to put the keyboard in the find field once it is on screen. */
   const [findFocus, setFindFocus] = useState(0);
-  const [zoom, setZoom] = useState(1);
+  const [viewZoom, setZoom] = useState(1);
+  /** Zoom of streamed tabs, which the stream applies by showing a smaller viewport larger. */
+  const [streamZoom, setStreamZoom] = useState<Record<string, number>>({});
   // The page view shown (this app's tab or a synced copy); a streamed tab has none here.
   const view: PageViewRef | null = !current ? null : native ? (current.targetId ? { targetId: current.targetId } : null) : synced ? { hostId, tabId: current.id } : null;
   const viewKey = view ? JSON.stringify(view) : '';
+  const zoom = view ? viewZoom : current ? (streamZoom[current.id] ?? 1) : 1;
+  const changeZoom = (step: 1 | -1 | 0) => {
+    if (view) void bc.pageView.zoom(view, step).then(setZoom);
+    else if (current) setStreamZoom((z) => ({ ...z, [current.id]: nextZoom(z[current.id] ?? 1, step) }));
+  };
 
   // remember the tab the user is looking at as the thread's current tab for the agent too
   useEffect(() => {
@@ -91,11 +98,13 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
   useEffect(() => bc.pageView.onFound((r) => setFind((f) => (f.open ? { ...f, matches: r.matches, active: r.activeMatchOrdinal } : f))), []);
   useEffect(() => {
     const shownView = view;
+    const tabId = current?.id;
     return () => {
       if (shownView) void bc.pageView.stopFind(shownView);
+      else if (tabId) void c?.rpc('browser/tabs/find', { tabId, text: '' }).catch(() => {});
       setFind((f) => ({ ...f, open: false, matches: 0, active: 0 }));
     };
-  }, [viewKey]);
+  }, [viewKey || current?.id]);
 
   // file inputs clicked by the user in the remote page: pick local files and upload them
   useEffect(() => {
@@ -140,10 +149,16 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
     void c?.rpc('browser/tabs/close', { tabId: tab.id }).catch((err) => toast(err.message));
   };
   const runFind = (text: string, forward = true, again = false) => {
-    if (view) void bc.pageView.find(view, text, { forward, again });
+    if (view) return void bc.pageView.find(view, text, { forward, again });
+    // A streamed tab is searched on its machine.
+    if (!current || !c) return;
+    void c
+      .rpc<{ matches: number; active: number }>('browser/tabs/find', { tabId: current.id, text, forward, again })
+      .then((r) => setFind((f) => (f.open && f.text === text ? { ...f, matches: r.matches, active: r.active } : f)))
+      .catch(() => {});
   };
   const openFind = () => {
-    if (!view) return;
+    if (!current) return;
     setFind((f) => ({ ...f, open: true }));
     setFindFocus((n) => n + 1);
   };
@@ -151,7 +166,7 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
     if (view) {
       void bc.pageView.stopFind(view);
       void bc.pageView.focus(view);
-    }
+    } else runFind('');
     setFind((f) => ({ ...f, open: false, matches: 0, active: 0 }));
   };
 
@@ -182,9 +197,11 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
       case 'forward':
         return navigate(action.type);
       case 'stop':
+        // Esc, in the page too: closes the find bar and stops loading (the page gets the key as well).
+        if (find.open) closeFind();
         return current?.loading && navigate('stop');
       case 'zoom':
-        return view && void bc.pageView.zoom(view, action.step).then(setZoom);
+        return changeZoom(action.step);
       case 'find':
         return openFind();
       case 'findNext':
@@ -304,8 +321,8 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
           {current?.loading ? <IconX size={14} /> : <IconRefresh size={14} />}
         </button>
         <AddressBar tabId={current?.id ?? null} url={current?.url ?? ''} inputRef={urlRef} onNavigate={(target) => navigate('goto', target)} />
-        {zoom !== 1 && view && (
-          <button className="zoom-badge" title="Reset zoom" onClick={() => void bc.pageView.zoom(view, 0).then(setZoom)}>
+        {zoom !== 1 && current && (
+          <button className="zoom-badge" title="Reset zoom" onClick={() => changeZoom(0)}>
             {Math.round(zoom * 100)}%
           </button>
         )}
@@ -363,7 +380,7 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
       ) : current && c && synced ? (
         <ReplicaViewport hostId={hostId} tab={current} hostName={hostLabel(host)} sameMachine={sameMachine} />
       ) : current && c ? (
-        <BrowserViewport key={`${hostId}:${c.port}`} connection={c} tabId={current.id} hostPlatform={host?.info?.platform ?? 'linux'} />
+        <BrowserViewport key={`${hostId}:${c.port}`} connection={c} tabId={current.id} hostPlatform={host?.info?.platform ?? 'linux'} zoom={zoom} />
       ) : (
         <div className="browser-empty">
           <IconGlobe size={28} />

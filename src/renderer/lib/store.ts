@@ -864,8 +864,16 @@ export async function interrupt(hostId: string, threadId: string) {
   updateThread(key, () => ({ stopping: true }));
   try {
     // The host stops whichever turn Codex is running, even if it is not the one shown here.
-    const res = await c.rpc<{ idle?: boolean }>('turn/interrupt', { threadId, turnId: tv.activeTurnId });
+    const res = await c.rpc<{ idle?: boolean; turnId?: string }>('turn/interrupt', { threadId, turnId: tv.activeTurnId });
     if (res?.idle) await settleIdleThread(hostId, threadId);
+    else if (res?.turnId) {
+      // Follow the turn that was actually stopped, so its end clears the working state.
+      updateThread(key, (cur) => {
+        if (cur.activeTurnId === res.turnId) return {};
+        const ended = cur.turns.some((t) => t.id === res.turnId && t.status !== 'inProgress');
+        return ended ? { activeTurnId: null, stopping: false } : { activeTurnId: res.turnId };
+      });
+    }
   } catch (err) {
     updateThread(key, () => ({ stopping: false }));
     toast((err as Error).message);
