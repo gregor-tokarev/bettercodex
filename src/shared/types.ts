@@ -174,17 +174,20 @@ export interface UpdateStatus {
   current: string;
   /**
    * How this copy updates: in place (the .app on macOS, the AppImage on Linux), from the release page
-   * (a .deb install, a quarantined Mac app) or not at all (development builds).
+   * (a .deb install, a quarantined Mac app) or not at all (development builds, builds made outside CI).
    */
   mode: 'inPlace' | 'manual' | 'off';
   /** Why the copy cannot update in place. */
   note: string | null;
-  state: 'idle' | 'checking' | 'downloading' | 'installing';
+  /** `ready`: downloaded and unpacked, waiting for the restart that puts it in place. */
+  state: 'idle' | 'checking' | 'downloading' | 'installing' | 'ready';
   /** A newer release than this build, if there is one. */
   available: { name: string; url: string; compareUrl: string | null; publishedAt: string } | null;
   /** Downloaded fraction while downloading. */
   progress: number | null;
-  /** The last failed check or install. */
+  /** The last failed check. */
   error: string | null;
+  /** The last failed install, including one that rolled back after a restart. */
+  installError: string | null;
   checkedAt: number | null;
 }

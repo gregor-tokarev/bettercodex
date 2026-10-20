@@ -207,6 +207,7 @@ function boot() {
   ipcMain.handle('updates:status', () => updater.status);
   ipcMain.handle('updates:check', () => updater.check());
   ipcMain.handle('updates:install', () => updater.install());
+  ipcMain.handle('updates:restart', () => updater.restart());
 
   ipcMain.handle('appBrowser:show', (e, targetId: string | null, bounds: Rect | null) => {
     const owner = BrowserWindow.fromWebContents(e.sender);
@@ -313,6 +314,7 @@ function boot() {
 
   // The host daemons keep running (threads live there); only tunnels close.
   app.on('before-quit', () => hosts.dispose());
+  app.on('will-quit', () => updater.discard());
 }
 
 async function waitForExit(pid: number, timeoutMs: number) {

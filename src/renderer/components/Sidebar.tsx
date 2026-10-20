@@ -34,11 +34,13 @@ function UpdateButton() {
       ? `Downloading update… ${Math.round((update.progress ?? 0) * 100)}%`
       : update.state === 'installing'
         ? 'Installing update…'
-        : update.mode === 'manual'
-          ? 'Download update'
-          : 'Update and restart';
+        : update.state === 'ready'
+          ? 'Restart to update'
+          : update.mode === 'manual'
+            ? 'Download update'
+            : 'Update and restart';
   return (
-    <button className="sidebar-button update" disabled={busy} title={`${update.current} → ${update.available.name}`} onClick={installUpdate}>
+    <button className="sidebar-button update" disabled={busy} title={`${update.current} → ${update.available.name}`} onClick={() => void installUpdate()}>
       {busy ? <Spinner size={13} /> : <IconDownload size={15} />}
       {label}
     </button>

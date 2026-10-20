@@ -61,8 +61,10 @@ interface Bridge {
   updates: {
     status(): Promise<UpdateStatus>;
     check(): Promise<UpdateStatus>;
-    /** Downloads the update and restarts into it (or opens the download page when this copy cannot replace itself). */
-    install(): Promise<void>;
+    /** Downloads and unpacks the update (or opens the download page when this copy cannot replace itself). */
+    install(): Promise<UpdateStatus>;
+    /** Quits and starts the downloaded update. */
+    restart(): Promise<void>;
     onStatus(cb: (status: UpdateStatus) => void): () => void;
   };
   onShortcut(cb: (e: { key: string; shift: boolean }) => void): () => void;

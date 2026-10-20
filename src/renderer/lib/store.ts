@@ -212,11 +212,23 @@ export function toast(message: string) {
   toastTimer = setTimeout(() => setState({ toast: null }), 5000);
 }
 
-/** Restarts into the available update; asks first while Codex is working, since a newer host restarts it. */
-export function installUpdate() {
-  const working = Object.values(state.hosts).some((h) => h.threads.some((t) => t.status.type === 'active'));
-  if (working && state.update?.mode === 'inPlace' && !window.confirm('Codex is still working in a thread, and updating may stop it. Update and restart now?')) return;
-  bc.updates.install().catch((err: Error) => toast(err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '')));
+const ipcMessage = (err: Error) => err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
+
+/**
+ * Downloads the available update and restarts into it. Codex may have started working during the
+ * download, and a newer host restarts it, so that is checked right before the restart.
+ */
+export async function installUpdate() {
+  try {
+    const update = state.update?.state === 'ready' ? state.update : await bc.updates.install();
+    if (update.state !== 'ready') return;
+    const working =
+      Object.values(state.threads).some((t) => t.activeTurnId) || Object.values(state.hosts).some((h) => h.threads.some((t) => t.status.type === 'active'));
+    if (working && !window.confirm('Codex is still working in a thread, and updating may stop it. Restart BetterCodex now?')) return;
+    await bc.updates.restart();
+  } catch (err) {
+    toast(ipcMessage(err as Error));
+  }
 }
 
 // ---------- connections ----------
@@ -251,7 +263,11 @@ function hostViewFrom(entry: HostListEntry, prev?: HostView): HostView {
 
 export async function initApp() {
   void bc.appInfo().then((info) => setState({ appInstanceId: info.instanceId }));
-  void bc.updates.status().then((update) => setState({ update }));
+  void bc.updates.status().then((update) => {
+    setState({ update });
+    // An update that rolled back after the last restart.
+    if (update.installError) toast(update.installError);
+  });
   bc.updates.onStatus((update) => setState({ update }));
   const list = await bc.hosts.list();
   applyHostList(list);

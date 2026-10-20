@@ -191,7 +191,7 @@ function UpdateSettings() {
   const update = useStore((s) => s.update);
   if (!update) return null;
   const { available, state } = update;
-  const busy = state !== 'idle';
+  const busy = state === 'downloading' || state === 'installing';
   return (
     <div className="settings-form">
       <div className="kv">
@@ -213,21 +213,24 @@ function UpdateSettings() {
         )}
       </div>
       {update.note && <p className="muted small">{update.note}</p>}
+      {update.installError && <p className="muted small">{update.installError}</p>}
       {update.error && <p className="muted small">{update.error}</p>}
       {update.mode !== 'off' && (
         <div className="form-actions left">
-          <button className="btn" disabled={busy} onClick={() => void bc.updates.check()}>
+          <button className="btn" disabled={state !== 'idle'} onClick={() => void bc.updates.check()}>
             Check for updates
           </button>
           {available && (
-            <button className="btn primary" disabled={busy} onClick={installUpdate}>
+            <button className="btn primary" disabled={busy} onClick={() => void installUpdate()}>
               {state === 'downloading'
                 ? `Downloading… ${Math.round((update.progress ?? 0) * 100)}%`
                 : state === 'installing'
                   ? 'Installing…'
-                  : update.mode === 'manual'
-                    ? 'Open download page'
-                    : 'Update and restart'}
+                  : state === 'ready'
+                    ? 'Restart to update'
+                    : update.mode === 'manual'
+                      ? 'Open download page'
+                      : 'Update and restart'}
             </button>
           )}
           {available?.compareUrl && (
