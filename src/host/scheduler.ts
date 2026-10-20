@@ -65,7 +65,7 @@ function newThreadPermissions(access: TaskAccess, cwd: string): TaskPermissions 
 
 function inside(child: string, parent: string) {
   const rel = path.relative(parent, child);
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  return rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
 }
 
 /** Whether something with `inner` permissions can do nothing that `outer` could not. */
@@ -93,6 +93,11 @@ function runPermissions(access: TaskAccess, memoryDir: string) {
         sandboxPolicy: { type: 'workspaceWrite', writableRoots: [memoryDir], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
       };
   }
+}
+
+function isSameTarget(input: NonNullable<TaskInput['target']>, current: TaskTarget) {
+  if (input.type === 'thread') return current.type === 'thread' && input.threadId === current.threadId;
+  return current.type === 'newThread' && path.resolve(expandHome(String(input.cwd || '').trim() || os.homedir())) === current.cwd;
 }
 
 function newId(prefix: string) {
@@ -249,17 +254,20 @@ export class Scheduler extends EventEmitter {
 
   async update(id: string, patch: TaskInput, actor: TaskActor | null = null): Promise<ScheduledTask> {
     const current = this.require(id);
-    // The agent must be allowed what the task can do now, and what it would do after the change.
-    let grant = await this.authorize(actor, await this.taskPermissions(current), current.target);
+    // An agent must be allowed what the task can do now, and what it would do after the change.
+    let grant = actor ? await this.authorize(actor, await this.taskPermissions(current), current.target) : null;
     const changes: Partial<ScheduledTask> = {};
     if (patch.name !== undefined) changes.name = String(patch.name).trim() || current.name;
     if (patch.prompt !== undefined) {
-      changes.prompt = String(patch.prompt).trim();
-      if (!changes.prompt) throw new RpcError(-32602, 'prompt cannot be empty');
+      const prompt = String(patch.prompt).trim();
+      if (!prompt) throw new RpcError(-32602, 'prompt cannot be empty');
+      if (prompt !== current.prompt) changes.prompt = prompt;
     }
     if (patch.model !== undefined) changes.model = patch.model || null;
     if (patch.effort !== undefined) changes.effort = patch.effort || null;
-    if (patch.target !== undefined || (patch.access !== undefined && patch.access !== null)) {
+    // The app sends every field on save; only a real change of destination or permissions counts.
+    const accessChanged = !!patch.access && patch.access !== current.access && (patch.target ?? current.target).type === 'newThread';
+    if ((patch.target && !isSameTarget(patch.target, current.target)) || accessChanged) {
       const target = patch.target ?? current.target;
       // A new folder keeps the task's permissions unless new ones are given.
       const keep = current.target.type === 'newThread' && target.type === 'newThread' ? current.access : null;
@@ -274,7 +282,7 @@ export class Scheduler extends EventEmitter {
 
     // Apply to the task as it is now: a run may have fired while we waited on Codex.
     const task = this.require(id);
-    const what = changes.prompt !== undefined || changes.target !== undefined || changes.access !== undefined;
+    const what = changes.prompt !== undefined || changes.target !== undefined || (changes.access !== undefined && changes.access !== task.access);
     Object.assign(task, changes, { updatedAt: now });
     if (what) task.grant = grant;
     let reschedule = false;
@@ -311,7 +319,7 @@ export class Scheduler extends EventEmitter {
 
   async remove(id: string, actor: TaskActor | null = null) {
     const task = this.require(id);
-    await this.authorize(actor, await this.taskPermissions(task), task.target);
+    if (actor) await this.authorize(actor, await this.taskPermissions(task), task.target);
     this.tasks = this.tasks.filter((t) => t.id !== id);
     for (const run of this.runs) {
       if (run.taskId === id && run.status === 'waiting') this.finish(run, 'interrupted', 'The task was deleted before the message was sent', false);
@@ -322,7 +330,7 @@ export class Scheduler extends EventEmitter {
 
   async runNow(id: string, actor: TaskActor | null = null) {
     const task = this.require(id);
-    await this.authorize(actor, await this.taskPermissions(task), task.target);
+    if (actor) await this.authorize(actor, await this.taskPermissions(task), task.target);
     if (this.active(id)) throw new RpcError(-32000, `Task ${id} is already running`);
     return this.fire(task, 'manual', Date.now());
   }
@@ -569,7 +577,8 @@ export class Scheduler extends EventEmitter {
       ...overrides,
     });
     run.turnId = res?.turn?.id ?? null;
-    if (run.threadId) this.busy.add(run.threadId);
+    // The turn may already have ended while the reply was on its way.
+    if (run.threadId && run.status === 'running') this.busy.add(run.threadId);
     this.changed();
   }
 
