@@ -97,6 +97,8 @@ export interface TaskDraft {
   taskId: string | null;
   prompt?: string;
   threadId?: string | null;
+  /** Called once the editor has saved the task. */
+  onSaved?: () => void;
 }
 
 export interface AppState {

@@ -4,9 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describeSchedule, nextRun, parseSchedule, systemTimeZone, type ScheduleInput } from '../shared/schedule.js';
-import type { ScheduledRun, ScheduledTask, ScheduleSnapshot, TaskAccess, TaskActor, TaskTarget } from '../shared/types.js';
+import type { ScheduledRun, ScheduledTask, ScheduleSnapshot, TaskAccess, TaskActor, TaskGrant, TaskPermissions, TaskTarget } from '../shared/types.js';
 import { RpcError, type CodexBridge } from './codex.js';
-import { paths, readJson, writeJson } from './config.js';
+import { machineId, paths, readJson, writeJson } from './config.js';
 import { errorMessage, log } from './log.js';
 
 /** What the app and agents send to create or change a task; omitted fields keep their value. */
@@ -21,11 +21,15 @@ export interface TaskInput {
   status?: 'active' | 'paused';
 }
 
-const MAX_RUNS = 300;
+type SandboxPolicy = { type?: string; networkAccess?: unknown; writableRoots?: string[] };
+
+/** Finished runs kept as history; runs still going are always kept. */
+const MAX_HISTORY = 300;
 /** Longest a timer sleeps, so a wall-clock jump (suspend, clock change) is noticed quickly. */
 const MAX_SLEEP = 30_000;
 const LEVEL: Record<TaskAccess, number> = { 'read-only': 0, auto: 1, full: 2 };
 const ACCESS_LABEL: Record<TaskAccess, string> = { 'read-only': 'read-only', auto: 'default (workspace-write)', full: 'full access' };
+const FULL: TaskPermissions = { level: 'full', network: true, roots: ['/'] };
 
 /** Permissions of the thread an agent calls from, from Codex's sandbox mode in the turn metadata. */
 export function accessOfSandboxMode(mode: string | null | undefined): TaskAccess {
@@ -34,7 +38,7 @@ export function accessOfSandboxMode(mode: string | null | undefined): TaskAccess
   return 'read-only';
 }
 
-function accessOfPolicy(policy: { type?: string } | null | undefined): TaskAccess {
+function accessOfPolicy(policy: SandboxPolicy | null | undefined): TaskAccess {
   switch (policy?.type) {
     case 'dangerFullAccess':
     case 'externalSandbox':
@@ -44,6 +48,36 @@ function accessOfPolicy(policy: { type?: string } | null | undefined): TaskAcces
     default:
       return 'read-only';
   }
+}
+
+function permissionsOf(policy: SandboxPolicy, cwd: string | null): TaskPermissions {
+  const level = accessOfPolicy(policy);
+  if (level === 'full') return FULL;
+  const roots = level === 'auto' ? [cwd, ...(policy.writableRoots ?? [])].filter((r): r is string => !!r) : [];
+  return { level, network: policy.networkAccess === true || policy.networkAccess === 'enabled', roots };
+}
+
+/** What a run that starts its own thread can do (its memory folder aside). */
+function newThreadPermissions(access: TaskAccess, cwd: string): TaskPermissions {
+  if (access === 'full') return FULL;
+  return { level: access, network: false, roots: access === 'auto' ? [cwd] : [] };
+}
+
+function inside(child: string, parent: string) {
+  const rel = path.relative(parent, child);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/** Whether something with `inner` permissions can do nothing that `outer` could not. */
+function within(inner: TaskPermissions, outer: TaskPermissions) {
+  if (outer.level === 'full') return true;
+  if (LEVEL[inner.level] > LEVEL[outer.level] || (inner.network && !outer.network)) return false;
+  return inner.roots.every((root) => outer.roots.some((allowed) => inside(root, allowed)));
+}
+
+function describePermissions(p: TaskPermissions) {
+  if (p.level !== 'auto') return ACCESS_LABEL[p.level];
+  return `${ACCESS_LABEL.auto}${p.roots.length ? ` in ${p.roots.join(', ')}` : ''}${p.network ? ' with network' : ''}`;
 }
 
 function runPermissions(access: TaskAccess, memoryDir: string) {
@@ -69,21 +103,31 @@ function expandHome(p: string) {
   return p === '~' ? os.homedir() : p.replace(/^~(?=\/)/, os.homedir());
 }
 
+const live = (run: ScheduledRun) => run.status === 'running' || run.status === 'waiting';
+
 /**
  * Runs this machine's scheduled tasks through its Codex app-server. Tasks keep running while the
  * app is closed: the host daemon outlives it. A run either starts a fresh thread or sends the prompt
  * into an existing thread, waiting for the thread's current turn to finish first.
+ *
+ * Agents may only set up tasks that cannot do more than their own thread: no higher sandbox level,
+ * no network they lack, no folders they cannot write, and nothing on other machines unless they
+ * have full access. The user, in the app, is not limited.
  */
 export class Scheduler extends EventEmitter {
   tasks: ScheduledTask[] = [];
   runs: ScheduledRun[] = [];
   readonly hostname = os.hostname();
+  readonly machineId = machineId();
   private timer: NodeJS.Timeout | null = null;
   private started = false;
   private changeTimer: NodeJS.Timeout | null = null;
-  /** Sandbox level of threads seen going through this host, so permission checks rarely need Codex. */
-  private threadAccess = new Map<string, TaskAccess>();
-  private delivering = new Set<string>();
+  /** Sandbox and folder of threads seen going through this host, so checks rarely need Codex. */
+  private threads = new Map<string, { policy: SandboxPolicy | null; cwd: string | null }>();
+  /** Deliveries into a thread happen one at a time. */
+  private locks = new Map<string, Promise<void>>();
+  /** Threads where we started a turn that has not ended yet. */
+  private busy = new Set<string>();
 
   constructor(
     private codex: CodexBridge,
@@ -93,6 +137,7 @@ export class Scheduler extends EventEmitter {
     super();
     codex.on('notification', (method: string, params: any) => this.onNotification(method, params));
     codex.on('status', (status: string) => {
+      this.busy.clear();
       if (status === 'ready') this.deliverAllWaiting();
       else this.interruptRunning('Codex stopped during the run');
     });
@@ -104,7 +149,7 @@ export class Scheduler extends EventEmitter {
 
   load() {
     const stored = readJson<{ tasks?: ScheduledTask[]; runs?: ScheduledRun[] }>(paths.schedules, {});
-    this.tasks = Array.isArray(stored.tasks) ? stored.tasks : [];
+    this.tasks = Array.isArray(stored.tasks) ? stored.tasks.map((t) => ({ ...t, grant: t.grant ?? null })) : [];
     this.runs = Array.isArray(stored.runs) ? stored.runs : [];
     // Turns die with the previous host and its Codex; messages still waiting for a thread are kept.
     for (const run of this.runs) {
@@ -136,10 +181,10 @@ export class Scheduler extends EventEmitter {
       case 'schedule/update':
         return { task: await this.update(params.id, params.patch ?? {}, actor), ...meta() };
       case 'schedule/delete':
-        this.remove(params.id, actor);
+        await this.remove(params.id, actor);
         return meta();
       case 'schedule/run':
-        return { run: this.runNow(params.id, actor), ...meta() };
+        return { run: await this.runNow(params.id, actor), ...meta() };
       case 'schedule/read':
         this.markRead(params.all ? 'all' : (params.ids ?? []));
         return {};
@@ -160,9 +205,11 @@ export class Scheduler extends EventEmitter {
     return describeSchedule(task.schedule, this.timezone);
   }
 
-  /** Remembers the permissions of threads started or changed through this host. */
-  noteThread(threadId: string | undefined, policy: { type?: string } | null | undefined) {
-    if (threadId && policy?.type) this.threadAccess.set(threadId, accessOfPolicy(policy));
+  /** Remembers the sandbox and folder of threads started or changed through this host. */
+  noteThread(threadId: string | undefined, policy: SandboxPolicy | null | undefined, cwd?: string | null) {
+    if (!threadId || (!policy?.type && !cwd)) return;
+    const known = this.threads.get(threadId);
+    this.threads.set(threadId, { policy: policy?.type ? policy : (known?.policy ?? null), cwd: cwd || known?.cwd || null });
   }
 
   // ---------- changes ----------
@@ -174,7 +221,8 @@ export class Scheduler extends EventEmitter {
     if (!input.target) throw new RpcError(-32602, 'target is required');
     const now = Date.now();
     const schedule = this.parse(input.schedule, now);
-    const { target, access } = await this.resolveTarget(input.target, input.access ?? null, actor);
+    const { target, access, permissions } = await this.resolveTarget(input.target, input.access ?? null, actor);
+    const grant = await this.authorize(actor, permissions, target);
     const task: ScheduledTask = {
       id: newId('task'),
       name: String(input.name ?? '').trim() || prompt.split('\n')[0].slice(0, 80),
@@ -190,9 +238,9 @@ export class Scheduler extends EventEmitter {
       createdAt: now,
       updatedAt: now,
       createdBy: actor,
+      grant,
     };
-    if (task.status === 'active') task.nextRunAt = this.firstRun(task, now);
-    if (task.status === 'active' && task.nextRunAt === null && schedule.type === 'once') task.nextRunAt = schedule.at;
+    if (task.status === 'active') task.nextRunAt = this.firstRun(task, now) ?? (schedule.type === 'once' ? schedule.at : null);
     this.tasks.push(task);
     log.info(`schedule: created ${task.id} "${task.name}" (${this.describe(task)})${actor ? ` by thread ${actor.threadId} on ${actor.machine}` : ''}`);
     this.changed();
@@ -200,49 +248,71 @@ export class Scheduler extends EventEmitter {
   }
 
   async update(id: string, patch: TaskInput, actor: TaskActor | null = null): Promise<ScheduledTask> {
-    const task = this.require(id, actor);
-    const now = Date.now();
-    const next: ScheduledTask = { ...task, updatedAt: now };
-    if (patch.name !== undefined) next.name = String(patch.name).trim() || task.name;
+    const current = this.require(id);
+    // The agent must be allowed what the task can do now, and what it would do after the change.
+    let grant = await this.authorize(actor, await this.taskPermissions(current), current.target);
+    const changes: Partial<ScheduledTask> = {};
+    if (patch.name !== undefined) changes.name = String(patch.name).trim() || current.name;
     if (patch.prompt !== undefined) {
-      next.prompt = String(patch.prompt).trim();
-      if (!next.prompt) throw new RpcError(-32602, 'prompt cannot be empty');
+      changes.prompt = String(patch.prompt).trim();
+      if (!changes.prompt) throw new RpcError(-32602, 'prompt cannot be empty');
     }
-    if (patch.model !== undefined) next.model = patch.model || null;
-    if (patch.effort !== undefined) next.effort = patch.effort || null;
+    if (patch.model !== undefined) changes.model = patch.model || null;
+    if (patch.effort !== undefined) changes.effort = patch.effort || null;
     if (patch.target !== undefined || (patch.access !== undefined && patch.access !== null)) {
-      const target = patch.target ?? task.target;
+      const target = patch.target ?? current.target;
       // A new folder keeps the task's permissions unless new ones are given.
-      const keep = task.target.type === 'newThread' && target.type === 'newThread' ? task.access : null;
+      const keep = current.target.type === 'newThread' && target.type === 'newThread' ? current.access : null;
       const resolved = await this.resolveTarget(target, patch.access ?? keep, actor);
-      next.target = resolved.target;
-      next.access = resolved.access;
+      grant = await this.authorize(actor, resolved.permissions, resolved.target);
+      changes.target = resolved.target;
+      changes.access = resolved.access;
     }
+    if (patch.status !== undefined && patch.status !== 'active' && patch.status !== 'paused') throw new RpcError(-32602, 'status must be "active" or "paused"');
+    const now = Date.now();
+    const schedule = patch.schedule !== undefined ? this.parse(patch.schedule, now) : null;
+
+    // Apply to the task as it is now: a run may have fired while we waited on Codex.
+    const task = this.require(id);
+    const what = changes.prompt !== undefined || changes.target !== undefined || changes.access !== undefined;
+    Object.assign(task, changes, { updatedAt: now });
+    if (what) task.grant = grant;
     let reschedule = false;
-    if (patch.schedule !== undefined) {
-      next.schedule = this.parse(patch.schedule, now);
+    if (schedule) {
+      task.schedule = schedule;
       reschedule = true;
       // A finished one-time task with a new time is live again.
-      if (task.status === 'completed' && patch.status === undefined) next.status = 'active';
+      if (task.status === 'completed' && patch.status === undefined) task.status = 'active';
     }
     if (patch.status !== undefined && patch.status !== task.status) {
-      if (patch.status !== 'active' && patch.status !== 'paused') throw new RpcError(-32602, 'status must be "active" or "paused"');
-      next.status = patch.status;
+      task.status = patch.status;
       reschedule = true;
     }
-    if (reschedule) {
-      next.nextRunAt = next.status === 'active' ? this.firstRun(next, now) : null;
-      // Resuming a one-time task whose moment passed while paused runs it right away.
-      if (next.status === 'active' && next.nextRunAt === null && next.schedule.type === 'once') next.nextRunAt = now;
+    if (what) {
+      // A message still waiting for its thread goes out again with the new prompt and destination.
+      for (const run of this.runs) {
+        if (run.taskId !== id || run.status !== 'waiting') continue;
+        this.finish(run, 'interrupted', 'Replaced by the edited task', false);
+        run.read = true;
+        if (task.schedule.type === 'once' && task.status === 'completed') {
+          task.status = 'active';
+          reschedule = true;
+        }
+      }
     }
-    Object.assign(task, next);
+    if (reschedule) {
+      task.nextRunAt = task.status === 'active' ? this.firstRun(task, now) : null;
+      // Resuming a one-time task whose moment passed while paused runs it right away.
+      if (task.status === 'active' && task.nextRunAt === null && task.schedule.type === 'once') task.nextRunAt = now;
+    }
     this.changed();
     return task;
   }
 
-  remove(id: string, actor: TaskActor | null = null) {
-    const task = this.require(id, actor);
-    this.tasks = this.tasks.filter((t) => t !== task);
+  async remove(id: string, actor: TaskActor | null = null) {
+    const task = this.require(id);
+    await this.authorize(actor, await this.taskPermissions(task), task.target);
+    this.tasks = this.tasks.filter((t) => t.id !== id);
     for (const run of this.runs) {
       if (run.taskId === id && run.status === 'waiting') this.finish(run, 'interrupted', 'The task was deleted before the message was sent', false);
     }
@@ -250,16 +320,17 @@ export class Scheduler extends EventEmitter {
     this.changed();
   }
 
-  runNow(id: string, actor: TaskActor | null = null) {
-    const task = this.require(id, actor);
-    if (this.active(task.id)) throw new RpcError(-32000, `Task ${id} is already running`);
+  async runNow(id: string, actor: TaskActor | null = null) {
+    const task = this.require(id);
+    await this.authorize(actor, await this.taskPermissions(task), task.target);
+    if (this.active(id)) throw new RpcError(-32000, `Task ${id} is already running`);
     return this.fire(task, 'manual', Date.now());
   }
 
   markRead(ids: string[] | 'all') {
     let any = false;
     for (const run of this.runs) {
-      if (!run.read && (ids === 'all' || ids.includes(run.id)) && run.status !== 'running' && run.status !== 'waiting') {
+      if (!run.read && (ids === 'all' || ids.includes(run.id)) && !live(run)) {
         run.read = true;
         any = true;
       }
@@ -284,64 +355,95 @@ export class Scheduler extends EventEmitter {
     return nextRun(task.schedule, now, this.timezone);
   }
 
-  private require(id: string, actor: TaskActor | null) {
+  private require(id: string) {
     const task = this.get(id);
     if (!task) throw new RpcError(-32004, `No task ${id} on ${this.hostname}`);
-    if (actor) {
-      const level = accessOfSandboxMode(actor.sandboxMode);
-      if (LEVEL[task.access] > LEVEL[level]) {
-        throw new RpcError(
-          -32003,
-          `Task ${id} runs with ${ACCESS_LABEL[task.access]}, more than this thread's ${ACCESS_LABEL[level]}, so it cannot change it. Ask the user to change it in the Scheduled view.`,
-        );
-      }
-    }
     return task;
   }
 
-  /** Checks a destination and works out the permissions runs get, capped at the calling agent's. */
+  // ---------- permissions ----------
+
+  /**
+   * Checks that an agent may set up something with `permissions`, and returns the grant to record
+   * (null for the user). Messages into the agent's own thread are always fine: that thread is the agent.
+   */
+  private async authorize(actor: TaskActor | null, permissions: TaskPermissions, target: TaskTarget): Promise<TaskGrant | null> {
+    if (!actor) return null;
+    const caller = await this.callerPermissions(actor);
+    const grant: TaskGrant = { ...caller, machineId: actor.machineId, threadId: actor.threadId };
+    if (caller.level === 'full') return grant;
+    if (actor.machineId !== this.machineId) {
+      throw new RpcError(-32003, `Only threads with full access can set up or change tasks on another machine; this thread has ${ACCESS_LABEL[caller.level]} permissions.`);
+    }
+    if (target.type === 'thread' && target.threadId === actor.threadId) return grant;
+    if (!within(permissions, caller)) {
+      throw new RpcError(
+        -32003,
+        `That task could do more than this thread may (${describePermissions(permissions)} vs. ${describePermissions(caller)}), so this thread cannot set it up or change it. ` +
+          'Ask the user to do it in the Scheduled view, or use a folder this thread can write.',
+      );
+    }
+    return grant;
+  }
+
+  /** What the calling agent's thread may do. Unknown details count as the least. */
+  private async callerPermissions(actor: TaskActor): Promise<TaskPermissions> {
+    const level = accessOfSandboxMode(actor.sandboxMode);
+    if (level === 'full') return FULL;
+    // Its folders are on another machine and mean nothing here.
+    if (actor.machineId !== this.machineId) return { level, network: false, roots: [] };
+    const known = this.threads.get(actor.threadId);
+    if (known?.policy && accessOfPolicy(known.policy) === level) return permissionsOf(known.policy, known.cwd);
+    let cwd = known?.cwd ?? null;
+    if (!cwd && level === 'auto') {
+      const res = await this.codex.request('thread/read', { threadId: actor.threadId }).catch(() => null);
+      cwd = res?.thread?.cwd ?? null;
+    }
+    return { level, network: false, roots: level === 'auto' && cwd ? [cwd] : [] };
+  }
+
+  /** What a task's runs can do right now (an existing thread's permissions may have changed since). */
+  private async taskPermissions(task: Pick<ScheduledTask, 'target' | 'access'>): Promise<TaskPermissions> {
+    if (task.target.type === 'newThread') return newThreadPermissions(task.access, task.target.cwd);
+    return this.threadPermissions(task.target.threadId);
+  }
+
+  private async threadPermissions(threadId: string): Promise<TaskPermissions> {
+    const known = this.threads.get(threadId);
+    if (known?.policy) return permissionsOf(known.policy, known.cwd);
+    // Resuming a loaded thread again is not free of side effects, and threads Codex starts itself
+    // (subagents) never pass through this host: assume the most.
+    const loaded = await this.codex.request('thread/loaded/list', {}).catch(() => null);
+    if (loaded?.data?.includes(threadId)) return FULL;
+    let res;
+    try {
+      res = await this.codex.request('thread/resume', { threadId, excludeTurns: true, config: this.threadConfig() });
+    } catch (err) {
+      throw new RpcError(-32004, `Thread ${threadId} was not found on ${this.hostname}: ${errorMessage(err)}`);
+    }
+    this.noteThread(threadId, res?.sandbox, res?.cwd);
+    return res?.sandbox ? permissionsOf(res.sandbox, res.cwd ?? null) : FULL;
+  }
+
+  /** Checks a destination and works out the permissions its runs get. */
   private async resolveTarget(
     input: NonNullable<TaskInput['target']>,
     requested: TaskAccess | null,
     actor: TaskActor | null,
-  ): Promise<{ target: TaskTarget; access: TaskAccess }> {
-    const limit = actor ? accessOfSandboxMode(actor.sandboxMode) : 'full';
+  ): Promise<{ target: TaskTarget; access: TaskAccess; permissions: TaskPermissions }> {
     if (requested && !(requested in LEVEL)) throw new RpcError(-32602, 'access must be "read-only", "auto" or "full"');
     if (input.type === 'newThread') {
       const cwd = path.resolve(expandHome(String(input.cwd || '').trim() || os.homedir()));
       if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) throw new RpcError(-32602, `Folder ${cwd} does not exist on ${this.hostname}`);
-      const access = requested ?? (actor ? limit : 'auto');
-      if (LEVEL[access] > LEVEL[limit]) {
-        throw new RpcError(-32003, `This thread has ${ACCESS_LABEL[limit]} permissions, so its tasks cannot run with ${ACCESS_LABEL[access]}.`);
-      }
-      return { target: { type: 'newThread', cwd }, access };
+      // Agents get their own level by default (and cannot get more); the user gets the composer's default.
+      const access = requested ?? (actor ? accessOfSandboxMode(actor.sandboxMode) : 'auto');
+      return { target: { type: 'newThread', cwd }, access, permissions: newThreadPermissions(access, cwd) };
     }
     if (input.type !== 'thread' || !input.threadId) throw new RpcError(-32602, 'target needs a threadId or type "newThread"');
     const threadId = String(input.threadId);
-    // Messages make the target thread act with its own permissions; an agent may only nudge threads
-    // that cannot do more than it can, besides itself.
-    const own = !!actor && actor.threadId === threadId && actor.machine === this.hostname;
-    const access = own ? limit : await this.accessOfThread(threadId);
-    if (actor && !own && LEVEL[access] > LEVEL[limit]) {
-      throw new RpcError(-32003, `Thread ${threadId} runs with ${ACCESS_LABEL[access]}, more than this thread's ${ACCESS_LABEL[limit]}, so it cannot be sent scheduled messages from here.`);
-    }
-    return { target: { type: 'thread', threadId }, access };
-  }
-
-  private async accessOfThread(threadId: string): Promise<TaskAccess> {
-    const known = this.threadAccess.get(threadId);
-    if (known) return known;
-    // Resuming a loaded thread again is not free of side effects, and threads Codex starts itself
-    // (subagents) never pass through this host: assume the most.
-    const loaded = await this.codex.request('thread/loaded/list', {}).catch(() => null);
-    if (loaded?.data?.includes(threadId)) return 'full';
-    try {
-      const res = await this.codex.request('thread/resume', { threadId, excludeTurns: true, config: this.threadConfig() });
-      this.noteThread(threadId, res?.sandbox);
-      return accessOfPolicy(res?.sandbox);
-    } catch (err) {
-      throw new RpcError(-32004, `Thread ${threadId} was not found on ${this.hostname}: ${errorMessage(err)}`);
-    }
+    const own = !!actor && actor.threadId === threadId && actor.machineId === this.machineId;
+    const permissions = own ? await this.callerPermissions(actor) : await this.threadPermissions(threadId);
+    return { target: { type: 'thread', threadId }, access: permissions.level, permissions };
   }
 
   // ---------- timing ----------
@@ -379,12 +481,13 @@ export class Scheduler extends EventEmitter {
   }
 
   private active(taskId: string) {
-    return this.runs.some((r) => r.taskId === taskId && (r.status === 'running' || r.status === 'waiting'));
+    return this.runs.some((r) => r.taskId === taskId && live(r));
   }
 
   // ---------- runs ----------
 
   private fire(task: ScheduledTask, trigger: ScheduledRun['trigger'], scheduledFor: number) {
+    const toThread = task.target.type === 'thread';
     const run: ScheduledRun = {
       id: newId('run'),
       taskId: task.id,
@@ -393,66 +496,64 @@ export class Scheduler extends EventEmitter {
       scheduledFor,
       startedAt: null,
       finishedAt: null,
-      status: 'running',
+      // Messages into a thread queue up behind whatever that thread is doing.
+      status: toThread ? 'waiting' : 'running',
       threadId: task.target.type === 'thread' ? task.target.threadId : null,
       turnId: null,
       summary: null,
       error: null,
       // Runs in an existing thread show up there; only fresh threads and failures land in the inbox.
-      read: task.target.type === 'thread',
+      read: toThread,
     };
     task.lastRunAt = Date.now();
     this.runs.unshift(run);
-    if (this.runs.length > MAX_RUNS) this.runs.length = MAX_RUNS;
+    this.prune();
     log.info(`schedule: running ${task.id} "${task.name}" (${trigger})`);
     this.changed();
-    void this.execute(task, run).catch((err) => this.finish(run, 'failed', errorMessage(err)));
+    if (run.threadId && toThread) void this.deliver(run.threadId);
+    else void this.startThread(task, run).catch((err) => this.finish(run, 'failed', errorMessage(err)));
     return run;
   }
 
-  private async execute(task: ScheduledTask, run: ScheduledRun) {
-    if (task.target.type === 'newThread') {
-      const memoryDir = path.join(paths.tasks, task.id);
-      fs.mkdirSync(memoryDir, { recursive: true });
-      const perms = runPermissions(task.access, memoryDir);
-      const started = await this.codex.request('thread/start', {
-        cwd: task.target.cwd,
-        model: task.model,
-        approvalPolicy: 'never',
-        sandbox: perms.sandbox,
-        config: this.threadConfig(),
-      });
-      run.threadId = started.thread.id as string;
-      this.noteThread(run.threadId, perms.sandboxPolicy);
-      this.changed();
-      await this.codex.request('thread/name/set', { threadId: run.threadId, name: task.name }).catch(() => {});
-      await this.startTurn(task, run, {
-        model: task.model,
-        effort: task.effort,
-        approvalPolicy: 'never',
-        sandboxPolicy: perms.sandboxPolicy,
-      });
-      return;
-    }
-    const threadId = task.target.threadId;
-    const status = await this.threadStatus(threadId);
-    if (status === 'active') {
-      run.status = 'waiting';
-      this.changed();
-      return;
-    }
-    await this.startTurn(task, run, {});
+  private prune() {
+    let finished = 0;
+    this.runs = this.runs.filter((run) => live(run) || ++finished <= MAX_HISTORY);
+  }
+
+  private async startThread(task: ScheduledTask, run: ScheduledRun) {
+    if (task.target.type !== 'newThread') return;
+    const memoryDir = path.join(paths.tasks, task.id);
+    fs.mkdirSync(memoryDir, { recursive: true });
+    const perms = runPermissions(task.access, memoryDir);
+    const started = await this.codex.request('thread/start', {
+      cwd: task.target.cwd,
+      model: task.model,
+      approvalPolicy: 'never',
+      sandbox: perms.sandbox,
+      config: this.threadConfig(),
+    });
+    run.threadId = started.thread.id as string;
+    this.noteThread(run.threadId, perms.sandboxPolicy, task.target.cwd);
+    this.changed();
+    await this.codex.request('thread/name/set', { threadId: run.threadId, name: task.name }).catch(() => {});
+    await this.startTurn(task, run, {
+      model: task.model,
+      effort: task.effort,
+      approvalPolicy: 'never',
+      sandboxPolicy: perms.sandboxPolicy,
+    });
   }
 
   /** Loads the thread into Codex if needed and reports whether a turn is running in it. */
   private async threadStatus(threadId: string): Promise<string> {
+    if (this.busy.has(threadId)) return 'active';
     const loaded = await this.codex.request('thread/loaded/list', {}).catch(() => null);
     if (loaded?.data?.includes(threadId)) {
       const res = await this.codex.request('thread/read', { threadId });
       return res?.thread?.status?.type ?? 'idle';
     }
     const res = await this.codex.request('thread/resume', { threadId, excludeTurns: true, config: this.threadConfig() });
-    this.noteThread(threadId, res?.sandbox);
+    this.noteThread(threadId, res?.sandbox, res?.cwd);
     return res?.thread?.status?.type ?? 'idle';
   }
 
@@ -468,6 +569,7 @@ export class Scheduler extends EventEmitter {
       ...overrides,
     });
     run.turnId = res?.turn?.id ?? null;
+    if (run.threadId) this.busy.add(run.threadId);
     this.changed();
   }
 
@@ -516,36 +618,63 @@ export class Scheduler extends EventEmitter {
 
   private deliverAllWaiting() {
     const threads = new Set(this.runs.filter((r) => r.status === 'waiting' && r.threadId).map((r) => r.threadId!));
-    for (const threadId of threads) void this.deliverWaiting(threadId, true);
+    for (const threadId of threads) void this.deliver(threadId);
   }
 
-  /** Sends the oldest message that waited for this thread, now that its turn ended. */
-  private async deliverWaiting(threadId: string, checkStatus: boolean) {
-    if (this.delivering.has(threadId)) return;
-    const run = this.runs.filter((r) => r.status === 'waiting' && r.threadId === threadId).sort((a, b) => a.scheduledFor - b.scheduledFor)[0];
-    if (!run) return;
-    const task = this.get(run.taskId);
-    if (!task) {
-      this.finish(run, 'interrupted', 'The task was deleted before the message was sent');
-      return;
-    }
-    this.delivering.add(threadId);
-    try {
-      if (checkStatus && (await this.threadStatus(threadId)) === 'active') return;
-      await this.startTurn(task, run, {});
-    } catch (err) {
-      this.finish(run, 'failed', errorMessage(err));
-    } finally {
-      this.delivering.delete(threadId);
+  /** Runs `fn` after every earlier delivery into the same thread has finished. */
+  private withThreadLock(threadId: string, fn: () => Promise<void>) {
+    const previous = this.locks.get(threadId) ?? Promise.resolve();
+    const next = previous.then(fn, fn);
+    const settled = next.catch(() => {});
+    this.locks.set(threadId, settled);
+    void settled.then(() => {
+      if (this.locks.get(threadId) === settled) this.locks.delete(threadId);
+    });
+    return next;
+  }
+
+  /** Sends the oldest message waiting for this thread, if the thread is free. */
+  private deliver(threadId: string) {
+    return this.withThreadLock(threadId, async () => {
+      const waiting = () => this.runs.filter((r) => r.status === 'waiting' && r.threadId === threadId).sort((a, b) => a.scheduledFor - b.scheduledFor)[0];
+      let run = waiting();
+      while (run && !this.get(run.taskId)) {
+        this.finish(run, 'interrupted', 'The task was deleted before the message was sent');
+        run = waiting();
+      }
+      if (!run) return;
+      const task = this.get(run.taskId)!;
+      try {
+        if ((await this.threadStatus(threadId)) === 'active') return;
+        await this.checkGrant(task, threadId);
+        await this.startTurn(task, run, {});
+      } catch (err) {
+        this.finish(run, 'failed', errorMessage(err));
+      }
+    }).catch((err) => log.error('schedule: delivery', errorMessage(err)));
+  }
+
+  /**
+   * An agent's message into another thread goes out only while that thread still cannot do more than
+   * the agent could when it set the message up; the user may have widened the thread's permissions since.
+   */
+  private async checkGrant(task: ScheduledTask, threadId: string) {
+    const grant = task.grant;
+    if (!grant || grant.level === 'full' || (grant.machineId === this.machineId && grant.threadId === threadId)) return;
+    const now = await this.threadPermissions(threadId);
+    if (!within(now, grant)) {
+      throw new Error(
+        `Thread ${threadId} now has ${describePermissions(now)}, more than the agent that scheduled this message had (${describePermissions(grant)}). Open the task in the Scheduled view and save it to allow it.`,
+      );
     }
   }
 
   private onNotification(method: string, params: any) {
     switch (method) {
       case 'thread/status/changed':
-        if (params?.status?.type !== 'active' && this.runs.some((r) => r.status === 'waiting' && r.threadId === params.threadId)) {
-          void this.deliverWaiting(params.threadId, params.status?.type === 'notLoaded');
-        }
+        if (params?.status?.type === 'active') return;
+        this.busy.delete(params?.threadId);
+        if (this.runs.some((r) => r.status === 'waiting' && r.threadId === params.threadId)) void this.deliver(params.threadId);
         return;
       case 'item/started': {
         // Match the turn by our message id in case the turn/start reply has not been handled yet.
@@ -558,18 +687,20 @@ export class Scheduler extends EventEmitter {
       case 'item/completed': {
         const item = params?.item;
         if (item?.type !== 'agentMessage' || !item.text) return;
-        const run = this.runs.find((r) => r.turnId === params.turnId && r.status === 'running');
-        if (run) run.summary = String(item.text).slice(0, 2000);
+        for (const run of this.runs) if (run.turnId === params.turnId && run.status === 'running') run.summary = String(item.text).slice(0, 2000);
         return;
       }
       case 'turn/completed': {
         const turn = params?.turn;
-        const run = turn && this.runs.find((r) => r.turnId === turn.id && r.status === 'running');
-        if (!run) return;
+        if (!turn) return;
+        this.busy.delete(params.threadId);
         const last = [...(turn.items ?? [])].reverse().find((i: any) => i.type === 'agentMessage' && i.text);
-        if (last) run.summary = String(last.text).slice(0, 2000);
         const status = turn.status === 'completed' ? 'completed' : turn.status === 'interrupted' ? 'interrupted' : 'failed';
-        this.finish(run, status, turn.error?.message ?? null);
+        for (const run of this.runs) {
+          if (run.turnId !== turn.id || run.status !== 'running') continue;
+          if (last) run.summary = String(last.text).slice(0, 2000);
+          this.finish(run, status, turn.error?.message ?? null);
+        }
         return;
       }
     }

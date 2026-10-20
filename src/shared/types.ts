@@ -132,10 +132,23 @@ export type TaskTarget =
 
 /** The agent thread that created or last changed a task; null when the user did it in the app. */
 export interface TaskActor {
+  /** Hostname, for people. */
   machine: string;
+  /** Stable id of the agent's BetterCodex host. */
+  machineId: string;
   threadId: string;
   sandboxMode: string | null;
 }
+
+/** What a thread may do: its sandbox level, network access and the folders it can write. */
+export interface TaskPermissions {
+  level: TaskAccess;
+  network: boolean;
+  roots: string[];
+}
+
+/** The permissions of the agent thread that last set a task's prompt or destination. */
+export type TaskGrant = TaskPermissions & { machineId: string; threadId: string };
 
 export interface ScheduledTask {
   id: string;
@@ -154,6 +167,8 @@ export interface ScheduledTask {
   createdAt: number;
   updatedAt: number;
   createdBy: TaskActor | null;
+  /** Messages into another thread must stay within this; null when the user set the prompt and destination. */
+  grant: TaskGrant | null;
 }
 
 export interface ScheduledRun {

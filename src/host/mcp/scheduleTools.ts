@@ -81,6 +81,8 @@ Choose where each run goes with \`thread\`:
 - a thread id: sends the prompt into that existing thread on that machine the same way.
 - "new": every run starts a fresh thread in \`cwd\` (default: this thread's folder; on another machine, its home folder). These runs never ask for approval, get a memory file to keep notes between runs, and report to the Scheduled inbox in the app.
 
+A task cannot do more than this thread: no higher permissions, no network or folders this thread lacks, and no messages into threads that can do more. Setting up tasks on other machines needs a thread with full access.
+
 Write prompts that make sense on their own when they arrive later. Before creating a task that may already exist, check \`list_tasks\`. Delete heartbeats and one-off checks you created once their job is done.
 `;
   }
@@ -102,14 +104,18 @@ Write prompts that make sense on their own when they arrive later. Before creati
   // ---------- helpers ----------
 
   private actor(ctx: ToolContext): TaskActor {
-    return { machine: os.hostname(), threadId: ctx.threadId, sandboxMode: ctx.sandboxMode ?? null };
+    return { machine: os.hostname(), machineId: this.scheduler.machineId, threadId: ctx.threadId, sandboxMode: ctx.sandboxMode ?? null };
   }
 
-  private place(machine?: string): Place {
+  /** Whether a machine name means this machine, by the name the app shows for it or the hostname. */
+  private async place(machine?: string): Promise<Place> {
     const name = String(machine ?? '').trim();
-    if (!name || ['this', 'current', 'here'].includes(name.toLowerCase()) || name.toLowerCase() === os.hostname().toLowerCase()) {
-      return { local: true, name: os.hostname() };
-    }
+    const here: Place = { local: true, name: os.hostname() };
+    if (!name || ['this', 'current', 'here'].includes(name.toLowerCase())) return here;
+    const list = await this.relay.machines().catch(() => null);
+    const match = list?.find((m) => m.name.toLowerCase() === name.toLowerCase());
+    if (match) return { local: match.current, name: match.name } as Place;
+    if (name.toLowerCase() === os.hostname().toLowerCase()) return here;
     return { local: false, name };
   }
 
@@ -131,7 +137,7 @@ Write prompts that make sense on their own when they arrive later. Before creati
 
   /** Finds the machine that has a task when the caller did not say. */
   private async locate(id: string, machine?: string): Promise<Place> {
-    if (machine) return this.place(machine);
+    if (machine) return await this.place(machine);
     if (this.scheduler.get(id)) return { local: true, name: os.hostname() };
     const { list } = await this.machines();
     for (const m of list) {
@@ -221,7 +227,7 @@ Write prompts that make sense on their own when they arrive later. Before creati
           let targets: Array<{ place: Place; connected: boolean }>;
           let note = '';
           if (args.machine) {
-            targets = [{ place: this.place(args.machine), connected: true }];
+            targets = [{ place: await this.place(args.machine), connected: true }];
           } else {
             const { list, appConnected } = await this.machines();
             targets = list.map((m) => ({ place: { local: m.current, name: m.name } as Place, connected: m.connected }));
@@ -266,7 +272,7 @@ Write prompts that make sense on their own when they arrive later. Before creati
           required: ['prompt', 'schedule', 'thread'],
         },
         run: async (args, ctx) => {
-          const place = this.place(args.machine);
+          const place = await this.place(args.machine);
           const task: TaskInput = {
             name: args.name,
             prompt: args.prompt,
@@ -347,7 +353,7 @@ Write prompts that make sense on their own when they arrive later. Before creati
         },
         annotations: { readOnlyHint: true },
         run: async (args) => {
-          const place = args.id ? await this.locate(args.id, args.machine) : this.place(args.machine);
+          const place = args.id ? await this.locate(args.id, args.machine) : await this.place(args.machine);
           const snap = await this.rpc<ScheduleSnapshot>(place, 'schedule/list', {});
           const runs = snap.runs.filter((r) => !args.id || r.taskId === args.id).slice(0, Math.max(1, Math.min(args.limit ?? 10, 50)));
           if (!runs.length) return `No runs yet on ${place.name}${args.id ? ` for ${args.id}` : ''}.`;

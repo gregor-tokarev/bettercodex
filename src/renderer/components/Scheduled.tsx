@@ -14,6 +14,7 @@ import {
   setState,
   setTaskStatus,
   toast,
+  unreadRuns,
   useStore,
   type HostView,
   type TaskDraft,
@@ -71,9 +72,9 @@ export function ScheduledView() {
         list.push({ hostId: id, run });
       }
     }
-    return list.sort((a, b) => (b.run.startedAt ?? b.run.scheduledFor) - (a.run.startedAt ?? a.run.scheduledFor)).slice(0, 40);
+    return list.sort((a, b) => (b.run.startedAt ?? b.run.scheduledFor) - (a.run.startedAt ?? a.run.scheduledFor));
   }, [hosts, order]);
-  const unread = runs.filter((r) => !r.run.read && r.run.status !== 'running' && r.run.status !== 'waiting');
+  const unread = useStore(unreadRuns);
 
   return (
     <section className="thread-view">
@@ -92,7 +93,7 @@ export function ScheduledView() {
         <div className="scheduled-inner">
           <div className="section-head">
             <h3>Inbox</h3>
-            {unread.length > 0 && (
+            {unread > 0 && (
               <button className="link-button inline" onClick={() => order.forEach((id) => hosts[id]?.schedule && void markRunsRead(id, 'all'))}>
                 Mark all as read
               </button>
@@ -235,9 +236,12 @@ export function ThreadSchedules({ hostId, threadId }: { hostId: string; threadId
   const now = useNow();
   const snap = host?.schedule;
   if (!snap) return null;
-  const tasks = snap.tasks.filter((t) => t.target.type === 'thread' && t.target.threadId === threadId && t.status !== 'completed');
   const waiting = snap.runs.filter((r) => r.threadId === threadId && r.status === 'waiting');
-  if (!tasks.length && !waiting.length) return null;
+  // A one-time message counts as done once it fires, but it stays here until it is really sent.
+  const tasks = snap.tasks.filter(
+    (t) => t.target.type === 'thread' && t.target.threadId === threadId && (t.status !== 'completed' || waiting.some((r) => r.taskId === t.id)),
+  );
+  if (!tasks.length) return null;
   return (
     <div className="thread-schedules">
       {tasks.map((task) => (
@@ -321,8 +325,8 @@ export function SendLater({ hostId, threadId, text, onScheduled }: { hostId: str
             className="popover-item"
             onClick={() => {
               setOpen(false);
-              openTaskEditor({ hostId, taskId: null, threadId, prompt: text });
-              onScheduled();
+              // The composer keeps the text until the task is really saved.
+              openTaskEditor({ hostId, taskId: null, threadId, prompt: text, onSaved: onScheduled });
             }}
           >
             Custom time or repeat…
@@ -463,7 +467,9 @@ function TaskEditorModal({ draft }: { draft: TaskDraft }) {
       access,
     });
     setSaving(false);
-    if (saved) close();
+    if (!saved) return;
+    draft.onSaved?.();
+    close();
   };
 
   const set = (patch: Partial<ScheduleForm>) => setForm((f) => ({ ...f, ...patch }));

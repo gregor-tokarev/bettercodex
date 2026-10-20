@@ -284,8 +284,8 @@ export class HostServer {
     if (opensThread) params = { ...params, config: this.threadConfig(params.config) };
     const result = await this.codex.request(method, params);
     // The scheduler checks thread permissions before letting agents message other threads.
-    if (opensThread) this.scheduler.noteThread(result?.thread?.id, result?.sandbox);
-    else if ((method === 'turn/start' || method === 'thread/settings/update') && params.sandboxPolicy) this.scheduler.noteThread(params.threadId, params.sandboxPolicy);
+    if (opensThread) this.scheduler.noteThread(result?.thread?.id, result?.sandbox, result?.cwd);
+    else if (method === 'turn/start' || method === 'thread/settings/update') this.scheduler.noteThread(params.threadId, params.sandboxPolicy, params.cwd);
     return result;
   }
 

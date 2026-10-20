@@ -92,8 +92,8 @@ function offsetAt(instant: number, tz: string) {
  * The instant a wall-clock time happens in a time zone. A time skipped by a DST jump resolves
  * to the same distance past the jump; a repeated one resolves to its first occurrence.
  */
-export function zonedInstant(year: number, month: number, day: number, hour: number, minute: number, tz: string): number {
-  const naive = Date.UTC(year, month - 1, day, hour, minute);
+export function zonedInstant(year: number, month: number, day: number, hour: number, minute: number, tz: string, second = 0, ms = 0): number {
+  const naive = Date.UTC(year, month - 1, day, hour, minute, second, ms);
   const before = naive - offsetAt(naive - 24 * 3600_000, tz);
   const after = naive - offsetAt(naive + 24 * 3600_000, tz);
   const candidates = [before, after].filter((t) => naive - offsetAt(t, tz) === t).sort((a, b) => a - b);
@@ -267,10 +267,10 @@ function parseAt(at: string | number, now: number, tz: string): number {
     return instant;
   }
   // An explicit offset or Z is absolute; a bare date-time is wall-clock time in `tz`.
-  const local = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?$/.exec(text);
+  const local = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{1,2}):(\d{2})(?::(\d{2})(\.\d+)?)?)?$/.exec(text);
   if (local) {
-    const [, y, mo, d, h = '0', mi = '0'] = local;
-    return zonedInstant(Number(y), Number(mo), Number(d), Number(h), Number(mi), tz);
+    const [, y, mo, d, h = '0', mi = '0', sec = '0', frac = ''] = local;
+    return zonedInstant(Number(y), Number(mo), Number(d), Number(h), Number(mi), tz, Number(sec), Math.round(Number(`0${frac}`) * 1000));
   }
   const parsed = Date.parse(text);
   if (Number.isNaN(parsed)) throw new Error(`Could not read the time "${at}" (use ISO 8601 like 2026-10-21T09:00 or HH:MM)`);
