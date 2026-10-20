@@ -1,0 +1,103 @@
+{
+  "name": "bettercodex",
+  "version": "0.0.1",
+  "description": "A Codex desktop client with a per-machine browser that the agent can drive",
+  "private": true,
+  "type": "module",
+  "main": "dist/electron/main.cjs",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "npm run build && node scripts/start.mjs",
+    "dev": "node scripts/build.mjs --watch",
+    "host": "node dist/host/host.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test test/tools.test.mjs",
+    "dist": "npm run build && electron-builder",
+    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:linux": "npm run build && electron-builder --linux"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/ws": "^8.18.2",
+    "@vitejs/plugin-react": "^6.1.2",
+    "acorn": "^8.19.0",
+    "dompurify": "^3.4.17",
+    "electron": "^44.9.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.2",
+    "marked": "^18.1.1",
+    "playwright-core": "^1.64.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4",
+    "ws": "^8.22.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "electron@44.9.0": true,
+    "electron-winstaller": false
+  },
+  "productName": "BetterCodex",
+  "build": {
+    "appId": "dev.bettercodex.app",
+    "productName": "BetterCodex",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/electron/**",
+      "dist/renderer/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "dist/host",
+        "to": "host",
+        "filter": [
+          "**/*",
+          "!**/*.map"
+        ]
+      }
+    ],
+    "asar": true,
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "build/icon.png",
+      "identity": "-",
+      "hardenedRuntime": false,
+      "notarize": false
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Development",
+      "icon": "build/icon.png",
+      "executableArgs": [
+        "--no-sandbox"
+      ],
+      "maintainer": "Gregor Tokarev <e@tokarev.work>"
+    },
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}"
+  },
+  "desktopName": "bettercodex.desktop",
+  "author": {
+    "name": "Gregor Tokarev",
+    "email": "e@tokarev.work"
+  },
+  "homepage": "https://github.com/gregor-tokarev/bettercodex",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gregor-tokarev/bettercodex.git"
+  }
+}
