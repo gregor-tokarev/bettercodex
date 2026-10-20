@@ -18,25 +18,30 @@ const MARK_MATCHES = ({ text, step }: { text: string; step: 1 | -1 | null }): Fi
   const g = globalThis as any;
   const registry = g.CSS?.highlights;
   const Mark = g.Highlight;
-  const st: { text: string; ranges: Range[]; index: number; dirty: boolean; observer: MutationObserver | null } = (g.__bettercodexFind ??= {
-    text: '',
-    ranges: [],
-    index: -1,
-    dirty: true,
-    observer: null,
-  });
+  type State = { text: string; ranges: Range[]; index: number; dirty: boolean; observer: MutationObserver; resized: () => void };
+  // Only this world's own property: elements with that id show up on window too, in every world.
+  let st: State | undefined = Object.hasOwn(g, '__bettercodexFind') ? g.__bettercodexFind : undefined;
   if (!text) {
     registry?.delete('bettercodex-find');
     registry?.delete('bettercodex-find-active');
     document.getElementById('__bettercodex-find')?.remove();
-    st.observer?.disconnect();
-    g.__bettercodexFind = undefined;
+    if (st) {
+      st.observer.disconnect();
+      removeEventListener('resize', st.resized);
+    }
+    delete g.__bettercodexFind;
     return { matches: 0, active: 0 };
   }
-  if (!st.observer) {
-    st.observer = new MutationObserver(() => (st.dirty = true));
-    st.observer.observe(document, { subtree: true, childList: true, characterData: true, attributes: true });
+  if (!st) {
+    const fresh: State = { text: '', ranges: [], index: -1, dirty: true, observer: new MutationObserver(() => (fresh.dirty = true)), resized: () => (fresh.dirty = true) };
+    // What is visible changes with the content and with the viewport (zoom, panel size, media queries).
+    fresh.observer.observe(document, { subtree: true, childList: true, characterData: true, attributes: true });
+    addEventListener('resize', fresh.resized);
+    Object.defineProperty(g, '__bettercodexFind', { value: fresh, configurable: true });
+    st = fresh;
   }
+  // Next and Previous move on within the same search; anything else starts at its first match.
+  const continuing = step !== null && st.text === text && st.index >= 0;
   if (st.dirty || st.text !== text || step === null) {
     // Lowercase per code point, keeping its length, so offsets in the folded text are offsets in the page.
     const fold = (s: string) => {
@@ -102,12 +107,11 @@ const MARK_MATCHES = ({ text, step }: { text: string; step: 1 | -1 | null }): Fi
       range.setEnd(to.node, to.offset);
       ranges.push(range);
     }
-    if (st.text !== text || step === null) st.index = 0;
     st.text = text;
     st.ranges = ranges;
   }
   const n = st.ranges.length;
-  st.index = n ? (((st.index + (step ?? 0)) % n) + n) % n : -1;
+  st.index = !n ? -1 : continuing ? (((st.index + step!) % n) + n) % n : 0;
   const active = st.ranges[st.index];
   if (registry && Mark) {
     if (!document.getElementById('__bettercodex-find')) {
