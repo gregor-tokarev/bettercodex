@@ -15,8 +15,31 @@ const BUTTONS = ['left', 'middle', 'right', 'back', 'forward'] as const;
  * Live view of one remote tab: draws screencast frames on a canvas and forwards
  * mouse, wheel, keyboard, IME and clipboard input to the host's browser.
  */
-/** `zoom` makes the page larger the way browser zoom does: its viewport gets smaller and is shown scaled up. */
-export function BrowserViewport({ connection, tabId, hostPlatform, zoom = 1 }: { connection: HostConnection; tabId: string; hostPlatform: string; zoom?: number }) {
+/** The smallest viewport the host gives a streamed page; zoom stops where the panel would need less. */
+const MIN_VIEWPORT = { width: 240, height: 200 };
+
+/** The largest zoom a panel of this size can show (zooming shrinks the page's viewport). */
+export function maxStreamZoom(width: number, height: number) {
+  return Math.min(width / MIN_VIEWPORT.width, height / MIN_VIEWPORT.height);
+}
+
+/**
+ * `zoom` makes the page larger the way browser zoom does: its viewport gets smaller and is shown
+ * scaled up. `onMaxZoom` reports how far that can go in the panel's current size.
+ */
+export function BrowserViewport({
+  connection,
+  tabId,
+  hostPlatform,
+  zoom = 1,
+  onMaxZoom,
+}: {
+  connection: HostConnection;
+  tabId: string;
+  hostPlatform: string;
+  zoom?: number;
+  onMaxZoom?: (max: number) => void;
+}) {
   const container = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
@@ -93,7 +116,10 @@ export function BrowserViewport({ connection, tabId, hostPlatform, zoom = 1 }: {
     let closed = false;
     const attach = () => {
       const box = container.current;
-      send({ t: 'attach', tabId, width: (box?.clientWidth ?? 1000) / zoomRef.current, height: (box?.clientHeight ?? 700) / zoomRef.current });
+      const width = box?.clientWidth ?? 1000;
+      const height = box?.clientHeight ?? 700;
+      const z = Math.min(zoomRef.current, maxStreamZoom(width, height));
+      send({ t: 'attach', tabId, width: width / z, height: height / z });
     };
     socket.onopen = attach;
     socket.onmessage = (event) => {
@@ -129,7 +155,12 @@ export function BrowserViewport({ connection, tabId, hostPlatform, zoom = 1 }: {
     const box = container.current;
     if (!box) return;
     let timer: ReturnType<typeof setTimeout>;
-    const resize = () => send({ t: 'resize', width: Math.floor(box.clientWidth / zoomRef.current), height: Math.floor(box.clientHeight / zoomRef.current) });
+    const resize = () => {
+      const max = maxStreamZoom(box.clientWidth, box.clientHeight);
+      onMaxZoom?.(max);
+      const z = Math.min(zoomRef.current, max);
+      send({ t: 'resize', width: Math.floor(box.clientWidth / z), height: Math.floor(box.clientHeight / z) });
+    };
     const observer = new ResizeObserver(() => {
       clearTimeout(timer);
       timer = setTimeout(resize, 120);

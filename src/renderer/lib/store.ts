@@ -861,15 +861,18 @@ export async function interrupt(hostId: string, threadId: string) {
     toast('Host is not connected');
     return;
   }
+  const shown = tv.activeTurnId;
   updateThread(key, () => ({ stopping: true }));
   try {
     // The host stops whichever turn Codex is running, even if it is not the one shown here.
-    const res = await c.rpc<{ idle?: boolean; turnId?: string }>('turn/interrupt', { threadId, turnId: tv.activeTurnId });
-    if (res?.idle) await settleIdleThread(hostId, threadId);
-    else if (res?.turnId) {
+    const res = await c.rpc<{ idle?: boolean; turnId?: string }>('turn/interrupt', { threadId, turnId: shown });
+    // A turn started while this was on its way is not touched.
+    if (state.threads[key]?.activeTurnId !== shown) return;
+    if (res?.idle) await settleIdleThread(hostId, threadId, shown);
+    else if (res?.turnId && res.turnId !== shown) {
       // Follow the turn that was actually stopped, so its end clears the working state.
       updateThread(key, (cur) => {
-        if (cur.activeTurnId === res.turnId) return {};
+        if (cur.activeTurnId !== shown) return {};
         const ended = cur.turns.some((t) => t.id === res.turnId && t.status !== 'inProgress');
         return ended ? { activeTurnId: null, stopping: false } : { activeTurnId: res.turnId };
       });
@@ -880,14 +883,14 @@ export async function interrupt(hostId: string, threadId: string) {
   }
 }
 
-/** Codex runs nothing in this thread: show what it has and stop showing a turn as running. */
-async function settleIdleThread(hostId: string, threadId: string) {
+/** Codex ran nothing in this thread when asked: show what it has and stop showing `stale` as running. */
+async function settleIdleThread(hostId: string, threadId: string, stale: string) {
   const key = threadKey(hostId, threadId);
   await loadThread(hostId, threadId, true);
   updateThread(key, (tv) => ({
-    activeTurnId: null,
-    stopping: false,
-    turns: tv.turns.map((t) => (t.status === 'inProgress' ? { ...t, status: 'interrupted' } : t)),
+    // A turn that started since then keeps running.
+    ...(tv.activeTurnId === stale ? { activeTurnId: null, stopping: false } : {}),
+    turns: tv.turns.map((t) => (t.id === stale && t.status === 'inProgress' ? { ...t, status: 'interrupted' } : t)),
   }));
   void refreshThreads(hostId);
 }

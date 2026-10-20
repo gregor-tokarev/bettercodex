@@ -19,7 +19,7 @@ import {
 import { CodexBridge, RpcError, TIMEOUT } from './codex.js';
 import { loadConfig, paths, readJson, saveConfig, writeJson } from './config.js';
 import { errorMessage, log } from './log.js';
-import { FIND_IN_PAGE } from './browser/find.js';
+import { findInPage } from './browser/find.js';
 import { BrowserManager } from './browser/manager.js';
 import { StreamHub } from './browser/stream.js';
 import { SyncHub } from './browser/sync.js';
@@ -490,7 +490,9 @@ export class HostServer {
         // Streamed tabs only: the app finds in the pages it renders itself.
         if (!b.get(params.tabId)) throw new RpcError(-32602, 'no such tab');
         const page = await b.page(params.tabId);
-        return page.evaluate(FIND_IN_PAGE, { text: String(params.text ?? ''), forward: params.forward !== false, again: !!params.again });
+        const context = b.context;
+        if (!context) throw new RpcError(-32000, 'browser is not running');
+        return findInPage(params.tabId, () => context.newCDPSession(page), { text: String(params.text ?? ''), forward: params.forward !== false, again: !!params.again });
       }
       case 'browser/dialog/respond':
         await b.handleDialog(params.tabId, !!params.accept, params.promptText);

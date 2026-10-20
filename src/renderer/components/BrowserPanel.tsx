@@ -61,13 +61,14 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
   const [viewZoom, setZoom] = useState(1);
   /** Zoom of streamed tabs, which the stream applies by showing a smaller viewport larger. */
   const [streamZoom, setStreamZoom] = useState<Record<string, number>>({});
+  const [streamMaxZoom, setStreamMaxZoom] = useState(Infinity);
   // The page view shown (this app's tab or a synced copy); a streamed tab has none here.
   const view: PageViewRef | null = !current ? null : native ? (current.targetId ? { targetId: current.targetId } : null) : synced ? { hostId, tabId: current.id } : null;
   const viewKey = view ? JSON.stringify(view) : '';
-  const zoom = view ? viewZoom : current ? (streamZoom[current.id] ?? 1) : 1;
+  const zoom = view ? viewZoom : current ? Math.min(streamZoom[current.id] ?? 1, streamMaxZoom) : 1;
   const changeZoom = (step: 1 | -1 | 0) => {
     if (view) void bc.pageView.zoom(view, step).then(setZoom);
-    else if (current) setStreamZoom((z) => ({ ...z, [current.id]: nextZoom(z[current.id] ?? 1, step) }));
+    else if (current) setStreamZoom((z) => ({ ...z, [current.id]: Math.min(nextZoom(zoom, step), streamMaxZoom) }));
   };
 
   // remember the tab the user is looking at as the thread's current tab for the agent too
@@ -380,7 +381,7 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
       ) : current && c && synced ? (
         <ReplicaViewport hostId={hostId} tab={current} hostName={hostLabel(host)} sameMachine={sameMachine} />
       ) : current && c ? (
-        <BrowserViewport key={`${hostId}:${c.port}`} connection={c} tabId={current.id} hostPlatform={host?.info?.platform ?? 'linux'} zoom={zoom} />
+        <BrowserViewport key={`${hostId}:${c.port}`} connection={c} tabId={current.id} hostPlatform={host?.info?.platform ?? 'linux'} zoom={zoom} onMaxZoom={setStreamMaxZoom} />
       ) : (
         <div className="browser-empty">
           <IconGlobe size={28} />
