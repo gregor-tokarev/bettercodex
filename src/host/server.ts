@@ -17,7 +17,7 @@ import {
   type RelayRequest,
 } from '../shared/types.js';
 import { CodexBridge, RpcError } from './codex.js';
-import { loadConfig, paths, saveConfig } from './config.js';
+import { loadConfig, paths, readJson, saveConfig, writeJson } from './config.js';
 import { errorMessage, log } from './log.js';
 import { BrowserManager } from './browser/manager.js';
 import { StreamHub } from './browser/stream.js';
@@ -25,6 +25,7 @@ import { SyncHub } from './browser/sync.js';
 import { BrowserTools } from './mcp/tools.js';
 import { handleMcp, MCP_SERVER_NAME, SCHEDULER_SERVER_NAME } from './mcp/server.js';
 import { ScheduleTools } from './mcp/scheduleTools.js';
+import { browseHereInstructions } from './mcp/instructions.js';
 import { Scheduler } from './scheduler.js';
 
 interface Client {
@@ -45,7 +46,7 @@ export class HostServer {
   readonly streams = new StreamHub(this.browser);
   readonly sync = new SyncHub(this.browser);
   readonly tools = new BrowserTools(this.browser);
-  readonly scheduler = new Scheduler(this.codex, () => this.threadConfig(null));
+  readonly scheduler = new Scheduler(this.codex, (method, params) => this.openThread(method, params));
   readonly scheduleTools = new ScheduleTools(
     this.scheduler,
     {
@@ -61,6 +62,8 @@ export class HostServer {
   private http = http.createServer((req, res) => void this.onHttp(req, res));
   private wss = new WebSocketServer({ noServer: true, handleProtocols: () => WS_SUBPROTOCOL, perMessageDeflate: false });
   private hasNodeRepl = false;
+  private browseRule = crypto.createHash('sha256').update(browseHereInstructions()).digest('hex').slice(0, 16);
+  private briefed = this.loadBriefed();
   port = 0;
 
   constructor(
@@ -281,17 +284,56 @@ export class HostServer {
     if (method.startsWith('browser/')) return this.browserMethod(method, params);
     if (method.startsWith('schedule/')) return this.scheduler.rpc(method, params);
     const opensThread = method === 'thread/start' || method === 'thread/resume' || method === 'thread/fork';
-    if (opensThread) params = { ...params, config: this.threadConfig(params.config) };
-    const result = await this.codex.request(method, params);
+    const result = opensThread ? await this.openThread(method, params) : await this.codex.request(method, params);
     // The scheduler checks thread permissions before letting agents message other threads.
     if (opensThread) this.scheduler.noteThread(result?.thread?.id, result?.sandbox, result?.cwd);
     else if (method === 'turn/start' || method === 'thread/settings/update') this.scheduler.noteThread(params.threadId, params.sandboxPolicy, params.cwd);
     return result;
   }
 
+  /**
+   * Opens a thread with the host's tools plugged in. New threads get the browser rule with their
+   * developer instructions; resumed and forked ones keep the context they started with, so threads
+   * from before the rule or from other Codex clients get it appended once.
+   */
+  private async openThread(method: 'thread/start' | 'thread/resume' | 'thread/fork', params: any) {
+    const result = await this.codex.request(method, { ...params, config: await this.threadConfig(params.config, params.cwd) });
+    const threadId: string | undefined = result?.thread?.id;
+    if (!threadId || this.briefed.has(threadId)) return result;
+    // A fork cut at an earlier turn may end before the rule was appended to its parent.
+    const wholeFork = method === 'thread/fork' && !params.lastTurnId && !params.beforeTurnId && this.briefed.has(params.threadId);
+    if (method === 'thread/start' || wholeFork) this.markBriefed(threadId, true);
+    else await this.brief(threadId);
+    return result;
+  }
+
+  private async brief(threadId: string) {
+    // Marked first so a second client opening the thread meanwhile does not add it again.
+    this.markBriefed(threadId, true);
+    try {
+      const text = browseHereInstructions();
+      await this.codex.request('thread/inject_items', { threadId, items: [{ type: 'message', role: 'developer', content: [{ type: 'input_text', text }] }] });
+    } catch (err) {
+      this.markBriefed(threadId, false);
+      log.warn(`could not add the browser rule to thread ${threadId}`, errorMessage(err));
+    }
+  }
+
+  private loadBriefed() {
+    const stored = readJson<{ rule?: string; threads?: string[] }>(paths.briefed, {});
+    return new Set(stored.rule === this.browseRule ? (stored.threads ?? []) : []);
+  }
+
+  private markBriefed(threadId: string, briefed: boolean) {
+    if (briefed) this.briefed.add(threadId);
+    else this.briefed.delete(threadId);
+    writeJson(paths.briefed, { rule: this.browseRule, threads: [...this.briefed] });
+  }
+
   /** Per-thread overrides that plug the host's browser tools into Codex. */
-  private threadConfig(base: Record<string, unknown> | null | undefined) {
+  private async threadConfig(base: Record<string, unknown> | null | undefined, cwd?: string | null) {
     const config: Record<string, unknown> = { ...(base ?? {}) };
+    config.developer_instructions = await this.developerInstructions(config.developer_instructions, cwd);
     const key = `mcp_servers.${MCP_SERVER_NAME}`;
     config[`${key}.url`] = `http://127.0.0.1:${this.port}/mcp`;
     config[`${key}.http_headers`] = { Authorization: `Bearer ${this.mcpToken}` };
@@ -309,6 +351,16 @@ export class HostServer {
       if (this.hasNodeRepl) config['mcp_servers.node_repl.enabled'] = false;
     }
     return config;
+  }
+
+  /** The override replaces the user's own developer instructions, so keep theirs in front of the browser rule. */
+  private async developerInstructions(base: unknown, cwd?: string | null) {
+    let own = typeof base === 'string' ? base : null;
+    if (own === null) {
+      const res = await this.codex.request('config/read', { cwd: cwd ?? null }).catch((err) => log.warn('config/read failed', errorMessage(err)));
+      own = res?.config?.developer_instructions ?? null;
+    }
+    return [own?.trim(), browseHereInstructions()].filter(Boolean).join('\n\n');
   }
 
   private async inspectCodexConfig() {

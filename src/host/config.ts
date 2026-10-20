@@ -24,6 +24,8 @@ export const paths = {
   /** Per-task folders holding the memory file new-thread runs keep between runs. */
   tasks: path.join(BC_HOME, 'tasks'),
   machineId: path.join(BC_HOME, 'machine-id'),
+  /** Threads whose model context already holds the current browser rule. */
+  briefed: path.join(BC_HOME, 'briefed.json'),
 };
 
 export function ensureDirs() {

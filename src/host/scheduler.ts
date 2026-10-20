@@ -136,8 +136,8 @@ export class Scheduler extends EventEmitter {
 
   constructor(
     private codex: CodexBridge,
-    /** Per-thread config overrides that plug the host's MCP tools into Codex threads. */
-    private threadConfig: () => Record<string, unknown>,
+    /** Starts or resumes a thread with the host's MCP tools and browser rule plugged in. */
+    private openThread: (method: 'thread/start' | 'thread/resume', params: Record<string, unknown>) => Promise<any>,
   ) {
     super();
     codex.on('notification', (method: string, params: any) => this.onNotification(method, params));
@@ -426,7 +426,7 @@ export class Scheduler extends EventEmitter {
     if (loaded?.data?.includes(threadId)) return FULL;
     let res;
     try {
-      res = await this.codex.request('thread/resume', { threadId, excludeTurns: true, config: this.threadConfig() });
+      res = await this.openThread('thread/resume', { threadId, excludeTurns: true });
     } catch (err) {
       throw new RpcError(-32004, `Thread ${threadId} was not found on ${this.hostname}: ${errorMessage(err)}`);
     }
@@ -534,12 +534,11 @@ export class Scheduler extends EventEmitter {
     const memoryDir = path.join(paths.tasks, task.id);
     fs.mkdirSync(memoryDir, { recursive: true });
     const perms = runPermissions(task.access, memoryDir);
-    const started = await this.codex.request('thread/start', {
+    const started = await this.openThread('thread/start', {
       cwd: task.target.cwd,
       model: task.model,
       approvalPolicy: 'never',
       sandbox: perms.sandbox,
-      config: this.threadConfig(),
     });
     run.threadId = started.thread.id as string;
     this.noteThread(run.threadId, perms.sandboxPolicy, task.target.cwd);
@@ -561,7 +560,7 @@ export class Scheduler extends EventEmitter {
       const res = await this.codex.request('thread/read', { threadId });
       return res?.thread?.status?.type ?? 'idle';
     }
-    const res = await this.codex.request('thread/resume', { threadId, excludeTurns: true, config: this.threadConfig() });
+    const res = await this.openThread('thread/resume', { threadId, excludeTurns: true });
     this.noteThread(threadId, res?.sandbox, res?.cwd);
     return res?.thread?.status?.type ?? 'idle';
   }
