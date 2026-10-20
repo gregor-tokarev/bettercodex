@@ -124,8 +124,11 @@ export type SyncHostMessage =
       tabId: string;
       state: SyncState;
       cookies: SyncCookie[];
-      /** The page's open WebSockets, with the first frames each received (their handshake). */
-      sockets: Array<{ id: string; url: string; origin: string; frames: SocketFrame[] }>;
+      /**
+       * The page's open WebSockets, with the first frames each received (their handshake). Hosts
+       * from before sockets were relayed leave it out (another app on that machine may run one).
+       */
+      sockets?: Array<{ id: string; url: string; origin: string; frames: SocketFrame[] }>;
     }
   | { t: 'state'; tabId: string; state: SyncState; cookies?: { set: SyncCookie[]; removed: Array<Pick<SyncCookie, 'name' | 'domain' | 'path'>> } }
   | { t: 'action'; tabId: string; seq: number; action: SyncAction }
