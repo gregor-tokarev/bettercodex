@@ -119,20 +119,36 @@ export class Updater extends EventEmitter {
     }
   }
 
-  /** Staging space from an update that never got applied (the app quit or crashed first). */
+  /**
+   * Where updates are staged: next to the installed app, named after the process that downloaded
+   * them, since other profiles (BETTERCODEX_USER_DATA) may run the same app at the same time.
+   */
   private stagingPaths() {
     if (!this.target) return { dir: null, prefix: '' };
     const dir = path.dirname(this.target);
     const name = path.basename(this.target);
-    return { dir, prefix: process.platform === 'darwin' ? `.${name.replace(/\.app$/, '')}-update-` : `.${name}.update` };
+    return { dir, prefix: process.platform === 'darwin' ? `.${name.replace(/\.app$/, '')}-update-` : `.${name}.update-` };
   }
 
+  /** Removes updates whose process quit or crashed before applying them. */
   private removeLeftovers() {
     const { dir, prefix } = this.stagingPaths();
     if (!dir) return;
+    const abandoned = (name: string) => {
+      const pid = Number(/^(\d+)/.exec(name.slice(prefix.length))?.[1]);
+      if (!pid) return true;
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    };
     fs.promises
       .readdir(dir)
-      .then((names) => Promise.all(names.filter((n) => n.startsWith(prefix)).map((n) => fs.promises.rm(path.join(dir, n), { recursive: true, force: true }))))
+      .then((names) =>
+        Promise.all(names.filter((n) => n.startsWith(prefix) && abandoned(n)).map((n) => fs.promises.rm(path.join(dir, n), { recursive: true, force: true }))),
+      )
       .catch(() => {});
   }
 
@@ -211,7 +227,11 @@ export class Updater extends EventEmitter {
     try {
       staged.apply();
     } catch (err) {
-      staged.discard();
+      try {
+        staged.discard();
+      } catch {
+        // Left for removeLeftovers on a later start.
+      }
       const message = `Update failed: ${(err as Error).message}`;
       this.set({ state: 'idle', installError: message });
       throw new Error(message);
@@ -220,8 +240,13 @@ export class Updater extends EventEmitter {
 
   /** Drops a downloaded update that was not applied; call when the app quits. */
   discard() {
-    this.staged?.discard();
+    const staged = this.staged;
     this.staged = null;
+    try {
+      staged?.discard();
+    } catch {
+      // Left for removeLeftovers on a later start.
+    }
   }
 
   private asset(release: Release, suffix: string) {
@@ -245,7 +270,7 @@ export class Updater extends EventEmitter {
     this.assertWritable(path.dirname(bundle), bundle);
     // Next to the installed app, so every move of the swap is a rename on one file system.
     const { dir, prefix } = this.stagingPaths();
-    const work = await fs.promises.mkdtemp(path.join(dir!, prefix));
+    const work = await fs.promises.mkdtemp(path.join(dir!, `${prefix}${process.pid}-`));
     try {
       const zip = path.join(work, asset.name);
       await this.download(asset, zip);
@@ -279,7 +304,7 @@ export class Updater extends EventEmitter {
         discard: () => fs.rmSync(work, { recursive: true, force: true }),
       };
     } catch (err) {
-      await fs.promises.rm(work, { recursive: true, force: true });
+      await fs.promises.rm(work, { recursive: true, force: true }).catch(() => {});
       throw err;
     }
   }
@@ -290,12 +315,12 @@ export class Updater extends EventEmitter {
     this.assertWritable(path.dirname(appImage));
     // Next to the AppImage, so the rename below cannot cross file systems.
     const { dir, prefix } = this.stagingPaths();
-    const staged = path.join(dir!, prefix);
+    const staged = path.join(dir!, `${prefix}${process.pid}`);
     try {
       await this.download(asset, staged);
       await fs.promises.chmod(staged, 0o755);
     } catch (err) {
-      await fs.promises.rm(staged, { force: true });
+      await fs.promises.rm(staged, { force: true }).catch(() => {});
       throw err;
     }
     return {
