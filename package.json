@@ -83,12 +83,14 @@
       ],
       "category": "Development",
       "icon": "build/icon.png",
-      "executableArgs": [
-        "--no-sandbox"
-      ],
       "maintainer": "Gregor Tokarev <e@tokarev.work>"
     },
-    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}"
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "appImage": {
+      "executableArgs": [
+        "--no-sandbox"
+      ]
+    }
   },
   "desktopName": "bettercodex.desktop",
   "author": {

@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { TabInfo } from '../../shared/types';
-import { bc } from '../lib/bridge';
+import { bc, isMac } from '../lib/bridge';
 import { browserKey, conn, hostLabel, openTab, setPrefs, setState, toast, useStore, type Selection } from '../lib/store';
 import { BrowserViewport } from './BrowserViewport';
+import { onlyReachableThere } from '../../shared/syncPage';
+import { NativeViewport, ReplicaViewport, useReplicaStatus } from './NativeViewport';
 import { IconArrowLeft, IconArrowRight, IconChevronDown, IconExternal, IconGlobe, IconPlus, IconRefresh, IconX, Spinner } from './Icons';
 
 function Favicon({ tab }: { tab: TabInfo }) {
@@ -19,12 +21,21 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
   const draftTabs = useStore((s) => s.draftTabs[key]);
   const selectedId = useStore((s) => s.browserTab[key]);
   const width = useStore((s) => s.prefs.browserWidth);
+  const appInstanceId = useStore((s) => s.appInstanceId);
+  const remoteTabs = useStore((s) => s.prefs.remoteTabs);
+  const localName = useStore((s) => Object.values(s.hosts).find((h) => h.type === 'local')?.info?.hostname ?? null);
   const allTabs = host?.tabs ?? [];
+  // The host's browser is this very app: show its tabs natively instead of streaming them.
+  const native = !!appInstanceId && host?.info?.browser.engine === 'app' && host.info.browser.appInstanceId === appInstanceId;
+  // Another machine's tabs: rendered here as synced copies (or streamed, if chosen in Settings).
+  // Pages only that machine can reach (its localhost, its network) are streamed instead.
+  const sameMachine = host?.type === 'local' || (!!localName && host?.info?.hostname === localName);
   const tabs = useMemo(
     () => (threadId ? allTabs.filter((t) => t.threadId === threadId) : allTabs.filter((t) => draftTabs?.includes(t.id))),
     [allTabs, threadId, draftTabs],
   );
   const current = tabs.find((t) => t.id === selectedId) ?? tabs[tabs.length - 1] ?? null;
+  const synced = !native && remoteTabs !== 'stream' && !(current && !sameMachine && onlyReachableThere(current.url));
   const c = conn(hostId);
   const [url, setUrl] = useState('');
   const [editing, setEditing] = useState(false);
@@ -39,6 +50,17 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
   useEffect(() => {
     if (current && threadId) void c?.rpc('browser/tabs/select', { threadId, tabId: current.id }).catch(() => {});
   }, [current?.id, threadId]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((isMac ? e.metaKey : e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'l') {
+        e.preventDefault();
+        urlRef.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   // file inputs clicked by the user in the remote page: pick local files and upload them
   useEffect(() => {
@@ -88,25 +110,27 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
     <aside className="browser-panel" style={{ width }}>
       <div className="resize-handle" onMouseDown={startResize} />
       <div className="tab-strip">
-        {tabs.map((t) => (
-          <div key={t.id} className={`tab ${current?.id === t.id ? 'active' : ''} ${t.agentActive ? 'agent' : ''}`} onClick={() => select(t)} title={`${t.title}\n${t.url}`}>
-            <Favicon tab={t} />
-            <span className="tab-title">{t.title || t.url || 'New tab'}</span>
-            {t.agentActive && <span className="agent-dot" title="Codex is using this tab" />}
-            <button
-              className="tab-close"
-              onClick={(e) => {
-                e.stopPropagation();
-                void c?.rpc('browser/tabs/close', { tabId: t.id });
-              }}
-            >
-              <IconX size={11} />
-            </button>
-          </div>
-        ))}
-        <button className="icon-button" title="New tab" onClick={() => void openTab(selection)}>
-          <IconPlus size={14} />
-        </button>
+        <div className="tab-list">
+          {tabs.map((t) => (
+            <div key={t.id} className={`tab ${current?.id === t.id ? 'active' : ''} ${t.agentActive ? 'agent' : ''}`} onClick={() => select(t)} title={`${t.title}\n${t.url}`}>
+              <Favicon tab={t} />
+              <span className="tab-title">{t.title || t.url || 'New tab'}</span>
+              {t.agentActive && <span className="agent-dot" title="Codex is using this tab" />}
+              <button
+                className="tab-close"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void c?.rpc('browser/tabs/close', { tabId: t.id });
+                }}
+              >
+                <IconX size={11} />
+              </button>
+            </div>
+          ))}
+          <button className="icon-button" title="New tab" onClick={() => void openTab(selection)}>
+            <IconPlus size={14} />
+          </button>
+        </div>
         <div className="spacer" />
         <div className="dropdown">
           <button className="icon-button" title="All tabs on this machine" onClick={() => setMenuOpen((o) => !o)}>
@@ -117,7 +141,9 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
               <div className="popover-header">Browser on {hostLabel(host)}</div>
               <div className="popover-note">
                 {host?.info?.browser.state === 'running'
-                  ? `${host.info.browser.mode} · Chromium ${host.info.browser.version?.replace(/^\D+/, '') ?? ''}`
+                  ? host.info.browser.engine === 'app'
+                    ? `BetterCodex app${native ? ' · this window' : ''} · Chromium ${host.info.browser.version?.replace(/^\D+/, '') ?? ''}`
+                    : `${host.info.browser.mode} · Chromium ${host.info.browser.version?.replace(/^\D+/, '') ?? ''}`
                   : (host?.info?.browser.error ?? host?.info?.browser.state)}
               </div>
               {otherTabs.length > 0 && <div className="popover-header">Tabs in other threads</div>}
@@ -191,6 +217,7 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
             }}
           />
         </form>
+        {current && synced && <SyncBadge hostId={hostId} tabId={current.id} hostName={hostLabel(host)} />}
         {current && /^https?:/.test(current.url) && (
           <button className="icon-button" title="Open in system browser" onClick={() => void bc.openExternal(current.url)}>
             <IconExternal size={14} />
@@ -204,7 +231,11 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
           onRespond={(accept, text) => void c?.rpc('browser/dialog/respond', { tabId: current.id, accept, promptText: text }).catch((err) => toast(err.message))}
         />
       )}
-      {current && c ? (
+      {current && c && native ? (
+        <NativeViewport connection={c} tab={current} />
+      ) : current && c && synced ? (
+        <ReplicaViewport hostId={hostId} tab={current} hostName={hostLabel(host)} sameMachine={sameMachine} />
+      ) : current && c ? (
         <BrowserViewport key={`${hostId}:${c.port}`} connection={c} tabId={current.id} hostPlatform={host?.info?.platform ?? 'linux'} onFocusUrl={() => urlRef.current?.focus()} />
       ) : (
         <div className="browser-empty">
@@ -217,6 +248,22 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
       )}
     </aside>
   );
+}
+
+const SYNC_LABELS: Record<string, string> = {
+  connecting: 'Connecting',
+  loading: 'Loading',
+  synced: 'In sync',
+  syncing: 'Sending changes',
+  offline: 'Offline, changes are not sent',
+  gone: 'Not open',
+};
+
+/** How this copy relates to the machine that owns the tab. */
+function SyncBadge({ hostId, tabId, hostName }: { hostId: string; tabId: string; hostName: string }) {
+  const status = useReplicaStatus(hostId, tabId);
+  const state = status?.status ?? 'connecting';
+  return <span className={`sync-badge ${state}`} title={`Copy of the tab on ${hostName}: ${SYNC_LABELS[state]}${status?.error ? ` (${status.error})` : ''}`} />;
 }
 
 function DialogBar({ dialog, onRespond }: { dialog: NonNullable<TabInfo['dialog']>; onRespond: (accept: boolean, text?: string) => void }) {

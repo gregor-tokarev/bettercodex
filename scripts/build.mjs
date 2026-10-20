@@ -14,7 +14,7 @@ const dist = path.join(root, 'dist');
 /** Hash of everything that ends up in the host bundle; part of the host version string. */
 function buildId() {
   const hash = crypto.createHash('sha256');
-  const files = [path.join(root, 'src/shared/types.ts'), path.join(root, 'package-lock.json')];
+  const files = [path.join(root, 'package-lock.json')];
   const walk = (dir) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       const full = path.join(dir, entry.name);
@@ -23,6 +23,7 @@ function buildId() {
     }
   };
   walk(path.join(root, 'src/host'));
+  walk(path.join(root, 'src/shared'));
   for (const file of files) if (fs.existsSync(file)) hash.update(fs.readFileSync(file));
   return hash.digest('hex').slice(0, 10);
 }
@@ -53,7 +54,12 @@ const hostOptions = {
 };
 
 const electronOptions = {
-  entryPoints: { main: path.join(root, 'src/electron/main.ts'), preload: path.join(root, 'src/electron/preload.ts') },
+  entryPoints: {
+    main: path.join(root, 'src/electron/main.ts'),
+    preload: path.join(root, 'src/electron/preload.ts'),
+    tabPreload: path.join(root, 'src/electron/tabPreload.ts'),
+    replicaPreload: path.join(root, 'src/electron/replicaPreload.ts'),
+  },
   outdir: path.join(dist, 'electron'),
   outExtension: { '.js': '.cjs' },
   bundle: true,
@@ -62,7 +68,7 @@ const electronOptions = {
   target: 'node20',
   sourcemap: 'linked',
   define,
-  external: ['electron'],
+  external: ['electron', 'bufferutil', 'utf-8-validate'],
   logLevel: 'info',
 };
 

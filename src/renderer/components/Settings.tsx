@@ -97,10 +97,22 @@ function HostConfigForm({ hostId }: { hostId: string }) {
           {info.browser.error ? ` — ${info.browser.error}` : ''}
         </span>
         <span>Profile</span>
-        <code>{info.browser.profileDir}</code>
+        {info.browser.engine === 'app' ? <span>The BetterCodex app's browser on this machine</span> : <code>{info.browser.profileDir}</code>}
       </div>
       <label>
-        Browser window
+        Browser
+        <select
+          className="text-input"
+          value={config.browser.engine ?? 'auto'}
+          onChange={(e) => void save({ ...config, browser: { ...config.browser, engine: e.target.value as HostConfig['browser']['engine'] } })}
+        >
+          <option value="auto">Automatic (the BetterCodex app when it is installed on this machine)</option>
+          <option value="app">BetterCodex app (tabs show natively in its window)</option>
+          <option value="chromium">Separate Chromium run by the host (streamed to the app)</option>
+        </select>
+      </label>
+      <label>
+        Chromium window
         <select
           className="text-input"
           value={config.browser.mode}
@@ -180,6 +192,7 @@ export function Settings() {
   const hosts = useStore((s) => s.hosts);
   const order = useStore((s) => s.hostOrder);
   const autoOpen = useStore((s) => s.prefs.autoOpenBrowser);
+  const remoteTabs = useStore((s) => s.prefs.remoteTabs);
   const theme = useStore((s) => s.prefs.theme);
   const selected = useStore((s) => s.selection?.hostId);
   const [adding, setAdding] = useState(false);
@@ -257,6 +270,13 @@ export function Settings() {
           <label className="checkbox">
             <input type="checkbox" checked={autoOpen} onChange={(e) => setPrefs({ autoOpenBrowser: e.target.checked })} />
             Show the browser panel when Codex starts using a tab
+          </label>
+          <label>
+            Tabs from other machines
+            <select className="text-input" value={remoteTabs} onChange={(e) => setPrefs({ remoteTabs: e.target.value as 'sync' | 'stream' })}>
+              <option value="sync">Synced copy (pages render here; clicks and typing are replayed there)</option>
+              <option value="stream">Live stream of the other machine's browser</option>
+            </select>
           </label>
         </div>
       </div>

@@ -4,7 +4,7 @@ import { Settings } from './components/Settings';
 import { Sidebar } from './components/Sidebar';
 import { ThreadView } from './components/ThreadView';
 import { getState, openThread, setPrefs, setState, useStore } from './lib/store';
-import { isMac } from './lib/bridge';
+import { bc, isMac } from './lib/bridge';
 
 export function App() {
   const selection = useStore((s) => s.selection);
@@ -34,7 +34,14 @@ export function App() {
       }
     };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    // Shortcuts pressed while a native browser tab has focus arrive from the main process.
+    const off = bc.onShortcut(({ key, shift }) => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key, shiftKey: shift, ctrlKey: !isMac, metaKey: isMac }));
+    });
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      off();
+    };
   }, []);
 
   return (

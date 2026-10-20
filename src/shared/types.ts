@@ -18,8 +18,16 @@ export interface HostRuntimeInfo {
 
 export type BrowserMode = 'auto' | 'headless' | 'headful';
 
+/**
+ * Which browser holds the machine's tabs: the BetterCodex app itself (native views, used when the
+ * app is installed on that machine) or a Chromium the host starts and streams to clients.
+ */
+export type BrowserEngine = 'auto' | 'app' | 'chromium';
+
 export interface HostConfig {
   browser: {
+    engine: BrowserEngine;
+    /** How the host-run Chromium is started (engine "chromium"). */
     mode: BrowserMode;
     /** Explicit Chrome/Chromium binary. Empty = auto-detect. */
     executablePath: string;
@@ -47,8 +55,11 @@ export interface HostInfo {
 
 export interface BrowserStatus {
   state: 'idle' | 'launching' | 'running' | 'error';
+  engine?: 'app' | 'chromium' | null;
+  /** The BetterCodex app process whose window can show the tabs natively (engine "app"). */
+  appInstanceId?: string | null;
   executablePath: string | null;
-  mode: 'headless' | 'headful' | null;
+  mode: 'headless' | 'headful' | 'app' | null;
   version: string | null;
   error: string | null;
   profileDir: string;
@@ -71,6 +82,8 @@ export interface TabInfo {
   /** Set while an agent tool call is acting on the tab. */
   agentActive: boolean;
   dialog: TabDialog | null;
+  /** DevTools target of the live page; the app uses it to show the tab natively (engine "app"). */
+  targetId?: string | null;
 }
 
 export interface TabDialog {
@@ -89,6 +102,19 @@ export interface DownloadInfo {
   state: 'inProgress' | 'completed' | 'failed';
   error: string | null;
   createdAt: number;
+}
+
+/** How a BetterCodex app offers itself as the machine's browser (POST /app-browser). */
+export interface AppBrowserRegistration {
+  /** CDP endpoint of the app's tab bridge, including its secret path. */
+  url: string;
+  instanceId: string;
+  pid: number;
+  /** Command that starts the app again, used to bring it back in the background. */
+  launch: { exec: string; args: string[] };
+  background: boolean;
+  /** Whether Chromium's process sandbox protects the tab pages (off when started with --no-sandbox). */
+  sandboxed?: boolean;
 }
 
 // ---- main websocket (/ws): JSON text frames ----

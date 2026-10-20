@@ -107,6 +107,8 @@ export class HostManager extends EventEmitter {
   constructor(
     userData: string,
     private hostBundleDir: string,
+    /** Extra environment for the local host daemon. */
+    private localEnv: Record<string, string> = {},
   ) {
     super();
     this.file = path.join(userData, 'hosts.json');
@@ -199,7 +201,7 @@ export class HostManager extends EventEmitter {
   private async startLocal(command: 'start' | 'stop') {
     const { stdout } = await new Promise<{ stdout: string }>((resolve, reject) => {
       const child = spawn(process.execPath, [path.join(this.hostBundleDir, 'host.mjs'), command], {
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+        env: { ...process.env, ...this.localEnv, ELECTRON_RUN_AS_NODE: '1' },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let out = '';

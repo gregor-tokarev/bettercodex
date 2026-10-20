@@ -20,7 +20,20 @@ const app = await electron.launch({
   env: { ...process.env },
   timeout: 60000,
 });
-const win = await app.firstWindow();
+// The main process's own output (BETTERCODEX_DEBUG=1 for more) goes next to the screenshots.
+const mainLog = fs.createWriteStream(path.join(out, 'main.log'));
+app.process().stdout?.pipe(mainLog);
+app.process().stderr?.pipe(mainLog);
+
+// Browser tabs are pages of the app too; the UI is the one showing the renderer.
+const win = await (async () => {
+  for (let i = 0; i < 300; i++) {
+    const found = app.windows().find((p) => p.url().includes('renderer/index.html'));
+    if (found) return found;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return app.firstWindow();
+})();
 win.on('console', (m) => {
   if (m.type() === 'error' || m.type() === 'warning') console.log('[renderer]', m.type(), m.text());
 });
@@ -44,6 +57,14 @@ try {
   await shot('failure').catch(() => {});
   process.exitCode = 1;
 } finally {
-  await app.close().catch(() => {});
+  // app.close() can wait forever for its own evaluate to return; quit from a timer and watch the process.
+  const proc = app.process();
+  const exited = new Promise((r) => (proc.exitCode !== null ? r(true) : proc.once('exit', () => r(true))));
+  await app.evaluate(({ app: electronApp }) => setTimeout(() => electronApp.quit(), 10)).catch(() => {});
+  const closed = await Promise.race([exited, new Promise((r) => setTimeout(() => r(false), 15000))]);
+  if (!closed) {
+    console.log('app did not quit within 15s; killing it');
+    app.process().kill('SIGKILL');
+  }
 }
 process.exit(process.exitCode ?? 0);

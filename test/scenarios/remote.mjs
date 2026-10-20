@@ -2,6 +2,10 @@
 export default async function ({ win, shot, sleep }) {
   const target = process.env.REMOTE_TARGET ?? 'gregor@127.0.0.1';
   await win.click('text=Settings');
+  if (await win.$('.host-item:has-text("remote-sim")')) {
+    await win.click('.host-item:has-text("remote-sim") button:has-text("Remove")');
+    await sleep(500);
+  }
   await win.click('text=Add SSH machine…');
   await win.fill('input[placeholder^="me@devbox"]', target);
   await win.fill('input[placeholder="optional"]', 'remote-sim');

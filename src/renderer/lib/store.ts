@@ -72,6 +72,8 @@ export interface Prefs {
   browserWidth: number;
   sidebarWidth: number;
   autoOpenBrowser: boolean;
+  /** Tabs of other machines: a synced copy rendered here, or a live stream of that machine's screen. */
+  remoteTabs: 'sync' | 'stream';
   theme: 'system' | 'dark' | 'light';
   /** Last project folder per host. */
   cwd: Record<string, string>;
@@ -98,6 +100,8 @@ export interface AppState {
   prefs: Prefs;
   settingsOpen: boolean;
   toast: string | null;
+  /** This app process; a host whose browser is this app shows its tabs natively. */
+  appInstanceId: string | null;
 }
 
 const PREFS_KEY = 'bettercodex.prefs';
@@ -109,6 +113,7 @@ const defaultPrefs: Prefs = {
   browserWidth: 620,
   sidebarWidth: 280,
   autoOpenBrowser: true,
+  remoteTabs: 'sync',
   theme: 'system',
   cwd: {},
   collapsedProjects: {},
@@ -136,6 +141,7 @@ let state: AppState = {
   prefs: loadPrefs(),
   settingsOpen: false,
   toast: null,
+  appInstanceId: null,
 };
 const listeners = new Set<Listener>();
 
@@ -235,6 +241,7 @@ function hostViewFrom(entry: HostListEntry, prev?: HostView): HostView {
 }
 
 export async function initApp() {
+  void bc.appInfo().then((info) => setState({ appInstanceId: info.instanceId }));
   const list = await bc.hosts.list();
   applyHostList(list);
   bc.hosts.onChanged(applyHostList);

@@ -21,8 +21,50 @@ async function mcp(home, name, args) {
   return body.result.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n');
 }
 
+/** Client RPC to the local host (config changes). */
+async function hostRpc(home, method, params) {
+  const { port, token } = JSON.parse(fs.readFileSync(`${home}/host.json`, 'utf8'));
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, ['bettercodex.v1', `auth.${token}`]);
+  await new Promise((resolve, reject) => {
+    ws.onopen = resolve;
+    ws.onerror = reject;
+  });
+  const result = await new Promise((resolve) => {
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.t === 'res' && msg.id === 1) resolve(msg.result ?? msg.error);
+    };
+    ws.send(JSON.stringify({ t: 'rpc', id: 1, method, params }));
+  });
+  ws.close();
+  return result;
+}
+
 export default async function ({ win, shot, sleep }) {
   const home = process.env.BETTERCODEX_HOME;
+  // This exercises the streamed viewport, which remote machines use; locally the app shows tabs natively.
+  // Streaming is the optional mode for other machines' tabs (synced copies are the default).
+  await win.evaluate(() => {
+    const prefs = JSON.parse(localStorage.getItem('bettercodex.prefs') || '{}');
+    localStorage.setItem('bettercodex.prefs', JSON.stringify({ ...prefs, remoteTabs: 'stream' }));
+  });
+  await win.reload();
+  await win.waitForSelector('.sidebar-button:has-text("New thread")', { timeout: 30000 });
+  await sleep(1500);
+  const before = (await hostRpc(home, 'host/info', {})).config;
+  await hostRpc(home, 'host/config/set', { config: { browser: { ...before.browser, engine: 'chromium' } } });
+  try {
+    await run({ win, shot, sleep, home });
+  } finally {
+    await hostRpc(home, 'host/config/set', { config: { browser: { ...before.browser } } });
+    await win.evaluate(() => {
+      const prefs = JSON.parse(localStorage.getItem('bettercodex.prefs') || '{}');
+      localStorage.setItem('bettercodex.prefs', JSON.stringify({ ...prefs, remoteTabs: 'sync' }));
+    });
+  }
+}
+
+async function run({ win, shot, sleep, home }) {
   await win.click('.sidebar-button:has-text("New thread")');
   if (!(await win.$('.browser-panel'))) await win.click('button[title="Toggle browser"]');
   await win.click('.url-form input');

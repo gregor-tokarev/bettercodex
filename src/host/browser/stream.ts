@@ -3,6 +3,7 @@ import type { WebSocket } from 'ws';
 import type { FrameHeader, StreamClientMessage, StreamHostMessage } from '../../shared/types.js';
 import { errorMessage, log } from '../log.js';
 import type { BrowserManager } from './manager.js';
+import { SCROLL_BY } from '../mcp/tools.js';
 
 const MAX_BUFFERED = 1_500_000;
 
@@ -59,7 +60,8 @@ class TabStream {
   /** Pages that are idle produce no frames, so new viewers get an explicit capture. */
   async captureNow() {
     try {
-      const viewport = this.page.viewportSize() ?? { width: 1280, height: 800 };
+      const viewport =
+        this.page.viewportSize() ?? (await this.page.evaluate(() => ({ width: innerWidth, height: innerHeight })).catch(() => ({ width: 1280, height: 800 })));
       const shot = await this.cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: this.quality });
       const header: FrameHeader = { tabId: this.tabId, cssWidth: viewport.width, cssHeight: viewport.height, width: 0, height: 0, seq: ++this.seq };
       this.publish(encodeFrame(header, Buffer.from(shot.data, 'base64')));
@@ -169,6 +171,11 @@ export class StreamHub {
     switch (msg.t) {
       case 'mouse': {
         if (msg.type === 'mousePressed') this.browser.touch(stream.tabId);
+        // App browser tabs that are not on screen ignore wheel input; scroll from the page instead.
+        if (msg.type === 'mouseWheel' && this.browser.engine === 'app') {
+          await page.evaluate(SCROLL_BY, { x: msg.x, y: msg.y, dx: msg.deltaX ?? 0, dy: msg.deltaY ?? 0 }).catch(() => {});
+          return;
+        }
         await cdp.send('Input.dispatchMouseEvent', {
           type: msg.type,
           x: msg.x,
@@ -227,6 +234,7 @@ export class StreamHub {
     const stream = await this.streamFor(tabId);
     if (viewer.tabId !== tabId) return;
     stream.viewers.add(viewer);
+    this.browser.setRemoteViewers(tabId, 'stream', stream.viewers.size);
     this.browser.touch(tabId);
     send(viewer, { t: 'attached', tabId });
     await this.applyViewport(viewer);
@@ -243,6 +251,7 @@ export class StreamHub {
     const stream = this.streams.get(tabId);
     if (!stream) return;
     stream.viewers.delete(viewer);
+    this.browser.setRemoteViewers(tabId, 'stream', stream.viewers.size);
     if (stream.viewers.size === 0) await this.dropStream(tabId);
   }
 
@@ -252,6 +261,8 @@ export class StreamHub {
     if (!stream) return;
     const width = clamp(Math.round(viewer.width), 240, 3840);
     const height = clamp(Math.round(viewer.height), 200, 2400);
+    // App tabs are real views: size the view instead of emulating a viewport over it.
+    if (await this.browser.resizeAppTab(stream.tabId, width, height)) return;
     const current = stream.page.viewportSize();
     if (current?.width === width && current?.height === height) return;
     await stream.page.setViewportSize({ width, height });
@@ -279,6 +290,7 @@ export class StreamHub {
     const stream = this.streams.get(tabId);
     if (!stream) return;
     this.streams.delete(tabId);
+    this.browser.setRemoteViewers(tabId, 'stream', 0);
     for (const viewer of stream.viewers) {
       viewer.tabId = null;
       send(viewer, { t: 'error', message: 'tab closed' });

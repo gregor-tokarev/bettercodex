@@ -192,3 +192,13 @@ test('tabs of other threads are visible with all=true and can be claimed', async
   const tabs = await call('tabs', {});
   assert.doesNotMatch(tabs.text, /no tabs/);
 });
+
+test('the agent only ever sees browser tabs', async () => {
+  const res = await call('js', {
+    code: `const s = await context.browser().newBrowserCDPSession();
+      const { targetInfos } = await s.send('Target.getTargets');
+      JSON.stringify({ pages: context.pages().map((p) => p.url()), targets: targetInfos.map((t) => t.url) })`,
+  });
+  const { pages, targets } = JSON.parse(res.text);
+  for (const url of [...pages, ...targets]) assert.doesNotMatch(url, /renderer\/index\.html|^devtools:/, `exposed: ${url}`);
+});

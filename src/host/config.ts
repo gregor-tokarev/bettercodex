@@ -17,6 +17,8 @@ export const paths = {
   uploads: path.join(BC_HOME, 'uploads'),
   screenshots: path.join(BC_HOME, 'screenshots'),
   log: path.join(BC_HOME, 'host.log'),
+  /** How to start the BetterCodex app installed on this machine, recorded when it registers. */
+  app: path.join(BC_HOME, 'app.json'),
 };
 
 export function ensureDirs() {
@@ -26,7 +28,7 @@ export function ensureDirs() {
 }
 
 export const defaultConfig: HostConfig = {
-  browser: { mode: 'auto', executablePath: '', deviceScaleFactor: 1, jpegQuality: 75 },
+  browser: { engine: 'auto', mode: 'auto', executablePath: '', deviceScaleFactor: 1, jpegQuality: 75 },
   codex: { path: '', disableOfficialBrowser: true },
 };
 

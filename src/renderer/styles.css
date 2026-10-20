@@ -1386,11 +1386,20 @@ body.resizing * {
   padding: 7px 8px 0;
   min-height: 40px;
   -webkit-app-region: drag;
-  overflow-x: auto;
 }
 
 .tab-strip > * {
   -webkit-app-region: no-drag;
+}
+
+/* Only the tabs scroll; the menu next to them must not be clipped by the scroll box. */
+.tab-list {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
 }
 
 .tab {
@@ -1531,6 +1540,55 @@ body.resizing * {
   flex: 1;
   overflow: hidden;
   background: var(--bg);
+}
+
+.viewport-overlay.interactive {
+  pointer-events: auto;
+}
+
+.viewport-overlay.column {
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Sync state of a copy of another machine's tab, next to the address. */
+.sync-badge {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  margin: 0 4px;
+  background: var(--text-faint);
+}
+
+.sync-badge.synced {
+  background: #3fb950;
+}
+
+.sync-badge.syncing,
+.sync-badge.loading,
+.sync-badge.connecting {
+  background: #d29922;
+}
+
+.sync-badge.offline,
+.sync-badge.gone {
+  background: #f85149;
+}
+
+.viewport.native {
+  background: #fff;
+}
+
+/* A still of the native page while a menu covers it. */
+.viewport-backdrop {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: left top;
 }
 
 .viewport-canvas {

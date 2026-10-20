@@ -27,6 +27,19 @@ contextBridge.exposeInMainWorld('bc', {
     upload: (hostId: string, name: string, data: Uint8Array) => ipcRenderer.invoke('files:upload', hostId, name, data),
     read: (hostId: string, file: string) => ipcRenderer.invoke('files:read', hostId, file),
   },
+  appBrowser: {
+    show: (targetId: string | null, bounds: { x: number; y: number; width: number; height: number } | null) => ipcRenderer.invoke('appBrowser:show', targetId, bounds),
+    capture: (targetId: string) => ipcRenderer.invoke('appBrowser:capture', targetId),
+  },
+  replica: {
+    show: (hostId: string, tabId: string, bounds: { x: number; y: number; width: number; height: number } | null, sameMachine?: boolean) =>
+      ipcRenderer.invoke('replica:show', hostId, tabId, bounds, !!sameMachine),
+    capture: (hostId: string, tabId: string) => ipcRenderer.invoke('replica:capture', hostId, tabId),
+    reload: (hostId: string, tabId: string) => ipcRenderer.invoke('replica:reload', hostId, tabId),
+    status: (hostId: string, tabId: string) => ipcRenderer.invoke('replica:status', hostId, tabId),
+    onStatus: on('replica:status'),
+  },
+  onShortcut: on('app:shortcut'),
   openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url),
   appInfo: () => ipcRenderer.invoke('app:info'),
 });

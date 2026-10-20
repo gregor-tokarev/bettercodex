@@ -77,6 +77,10 @@ export class BrowserTools {
     const tab = this.browser.get(id);
     if (!tab) throw new Error(`Tab ${id} does not exist. Use \`tabs\` to list open tabs.`);
     if (tabId) this.browser.setCurrent(ctx.threadId, tab.id);
+    // A page in the app browser cannot do anything while its dialog is open.
+    if (tab.dialog && this.browser.engine === 'app') {
+      throw new Error(`A ${tab.dialog.type()} dialog is open in tab ${tab.id} (${JSON.stringify(tab.dialog.message())}). Answer it with the \`dialog\` tool first.`);
+    }
     const page = await this.browser.page(tab.id);
     return { tab, page };
   }
@@ -115,9 +119,11 @@ export class BrowserTools {
 
   private async describe(tabId: string, page: Page, opts: { snapshot?: boolean; before?: string[] } = {}) {
     const lines: string[] = [];
-    const title = await page.title().catch(() => '');
-    lines.push(`Tab ${tabId}: ${title || '(untitled)'} — ${shortUrl(page.url())}`);
     const tab = this.browser.get(tabId);
+    // While a dialog is open the page cannot run scripts (in the app browser it is fully blocked).
+    const blocked = !!tab?.dialog;
+    const title = blocked ? tab!.title : await page.title().catch(() => '');
+    lines.push(`Tab ${tabId}: ${title || '(untitled)'} — ${shortUrl(page.url())}`);
     if (tab?.dialog) {
       lines.push(`A ${tab.dialog.type()} dialog is open: ${JSON.stringify(tab.dialog.message())}. Handle it with the \`dialog\` tool.`);
     }
@@ -129,7 +135,7 @@ export class BrowserTools {
         lines.push(`New tab ${id} opened${info ? `: ${info.page?.url() ?? info.url}` : ''}. It is now the current tab.`);
       }
     }
-    if (opts.snapshot) lines.push('', await this.snapshotText(page));
+    if (opts.snapshot && !blocked) lines.push('', await this.snapshotText(page));
     return lines.join('\n');
   }
 
@@ -462,7 +468,7 @@ export class BrowserTools {
           const { tab, page } = await this.tabFor(ctx, args.tabId);
           return this.browser.withAgent(tab.id, async () => {
             const target = this.locate(page, args);
-            const viewport = page.viewportSize() ?? { width: 1280, height: 800 };
+            const viewport = page.viewportSize() ?? (await page.evaluate(() => ({ width: innerWidth, height: innerHeight })).catch(() => ({ width: 1280, height: 800 })));
             if (target && !args.direction) {
               await target.scrollIntoViewIfNeeded({ timeout: 10000 });
             } else {
@@ -474,8 +480,14 @@ export class BrowserTools {
               const amount = (args.pages ?? 1) * (args.direction === 'left' || args.direction === 'right' ? viewport.width : viewport.height) * 0.85;
               const dx = args.direction === 'left' ? -amount : args.direction === 'right' ? amount : 0;
               const dy = args.direction === 'up' ? -amount : args.direction === 'down' || !args.direction ? amount : 0;
+              const before = await page.evaluate(SCROLL_STATE, point).catch(() => null);
               await page.mouse.move(point.x, point.y);
               await page.mouse.wheel(dx, dy);
+              await page.waitForTimeout(150);
+              // Views of the app browser that are not on screen ignore wheel input; scroll from the page instead.
+              if (before !== null && before === (await page.evaluate(SCROLL_STATE, point).catch(() => null))) {
+                await page.evaluate(SCROLL_BY, { ...point, dx, dy }).catch(() => {});
+              }
             }
             await page.waitForTimeout(300);
             const pos = await page.evaluate(() => `scrollY=${Math.round(scrollY)} of ${document.documentElement.scrollHeight - innerHeight}`).catch(() => '');
@@ -705,6 +717,27 @@ export class BrowserTools {
 }
 
 const nodeGlobals = { require: createRequire(import.meta.url), process, fs };
+
+/** Scroll offsets of the page and of every scrollable box under a point. */
+const SCROLL_STATE = ({ x, y }: { x: number; y: number }) => {
+  const parts = [`${scrollX},${scrollY}`];
+  for (let el = document.elementFromPoint(x, y); el; el = el.parentElement) parts.push(`${el.scrollLeft},${el.scrollTop}`);
+  return parts.join(';');
+};
+
+/** Scrolls the innermost scrollable box under a point (or the page) like a wheel would. */
+export const SCROLL_BY = ({ x, y, dx, dy }: { x: number; y: number; dx: number; dy: number }) => {
+  for (let el = document.elementFromPoint(x, y); el && el !== document.documentElement && el !== document.body; el = el.parentElement) {
+    const style = getComputedStyle(el);
+    const canY = dy !== 0 && /(auto|scroll|overlay)/.test(style.overflowY) && el.scrollHeight > el.clientHeight;
+    const canX = dx !== 0 && /(auto|scroll|overlay)/.test(style.overflowX) && el.scrollWidth > el.clientWidth;
+    if (canY || canX) {
+      el.scrollBy(dx, dy);
+      return;
+    }
+  }
+  window.scrollBy(dx, dy);
+};
 
 function globMatch(glob: string, value: string) {
   if (!glob.includes('*')) return false;

@@ -8,6 +8,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import {
   HOST_VERSION,
   WS_SUBPROTOCOL,
+  type AppBrowserRegistration,
   type ClientMessage,
   type HostConfig,
   type HostInfo,
@@ -18,6 +19,7 @@ import { loadConfig, paths, saveConfig } from './config.js';
 import { errorMessage, log } from './log.js';
 import { BrowserManager } from './browser/manager.js';
 import { StreamHub } from './browser/stream.js';
+import { SyncHub } from './browser/sync.js';
 import { BrowserTools } from './mcp/tools.js';
 import { handleMcp, MCP_SERVER_NAME } from './mcp/server.js';
 
@@ -33,6 +35,7 @@ export class HostServer {
   readonly codex = new CodexBridge(() => this.config.codex.path);
   readonly browser = new BrowserManager(() => this.config);
   readonly streams = new StreamHub(this.browser);
+  readonly sync = new SyncHub(this.browser);
   readonly tools = new BrowserTools(this.browser);
   private clients = new Set<Client>();
   private nextClientId = 1;
@@ -58,13 +61,14 @@ export class HostServer {
     }
     this.http.on('upgrade', (req, socket, head) => {
       const url = new URL(req.url ?? '/', 'http://localhost');
-      if (!this.authorized(req, this.clientToken) || (url.pathname !== '/ws' && url.pathname !== '/stream')) {
+      if (!this.authorized(req, this.clientToken) || !['/ws', '/stream', '/sync'].includes(url.pathname)) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
         socket.destroy();
         return;
       }
       this.wss.handleUpgrade(req, socket, head, (ws) => {
         if (url.pathname === '/stream') this.streams.handle(ws);
+        else if (url.pathname === '/sync') this.sync.handle(ws);
         else this.onClient(ws);
       });
     });
@@ -82,6 +86,7 @@ export class HostServer {
       });
       if (ok) {
         this.port = port;
+        this.browser.setHostEndpoint(port, this.clientToken);
         return port;
       }
     }
@@ -148,6 +153,14 @@ export class HostServer {
         res.writeHead(200, { 'Content-Type': mimeFor(file), 'Content-Length': fs.statSync(file).size });
         await pipeline(fs.createReadStream(file), res).catch(() => res.destroy());
         return;
+      }
+      if (url.pathname === '/app-browser' && req.method === 'POST') {
+        const reg = JSON.parse(await readBody(req, 64 * 1024)) as AppBrowserRegistration;
+        if (typeof reg?.url !== 'string' || !/^ws:\/\/127\.0\.0\.1:\d+\//.test(reg.url) || !reg.instanceId || !reg.pid || !reg.launch?.exec) {
+          return json(res, 400, { error: 'bad registration' });
+        }
+        this.browser.registerApp(reg);
+        return json(res, 200, { ok: true });
       }
       if (url.pathname === '/upload' && req.method === 'POST') {
         const name = path.basename(url.searchParams.get('name') || 'upload.bin');
@@ -244,11 +257,13 @@ export class HostServer {
         return this.info();
       case 'host/config/set': {
         const patch = params.config as Partial<HostConfig>;
+        const engineBefore = this.config.browser.engine;
         this.config = {
           browser: { ...this.config.browser, ...(patch.browser ?? {}) },
           codex: { ...this.config.codex, ...(patch.codex ?? {}) },
         };
         saveConfig(this.config);
+        if (this.config.browser.engine !== engineBefore && this.browser.context) void this.browser.reset().catch((err) => log.warn('browser reset', errorMessage(err)));
         this.broadcast({ t: 'notif', method: 'host/info', params: this.info() });
         return this.info();
       }
@@ -287,6 +302,13 @@ export class HostServer {
       case 'browser/tabs/select':
         b.setCurrent(params.threadId, params.tabId);
         return {};
+      case 'browser/tabs/wake': {
+        // A client is about to show the tab (natively in the app): make sure it has a live page.
+        await b.page(params.tabId);
+        b.touch(params.tabId);
+        const tab = b.get(params.tabId);
+        return { tab: tab ? b.info(tab) : null };
+      }
       case 'browser/tabs/assign':
         b.assign(params.tabId, params.threadId ?? null);
         return {};
@@ -338,6 +360,21 @@ function safeEqual(a: string, b: string) {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
   return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
+
+function readBody(req: http.IncomingMessage, limit: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > limit) {
+        reject(new Error('request too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => resolve(body));
+    req.on('error', reject);
+  });
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown) {

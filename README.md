@@ -10,6 +10,10 @@ Work with Codex threads on your laptop or on any machine you reach over SSH. Eac
 the sign-ins and open tabs Codex uses are the ones on that machine, and every window you open shows the same tabs.
 Codex can read and drive those tabs freely, and you can click and type in them right next to the chat.
 
+Pages always render on the computer you are sitting at, so they feel like any other browser. A tab that lives on
+another machine shows up as a synced copy: what you click and type in it happens on that machine too, and what Codex
+does there shows up in your copy a moment later. Forms are sent once, from the machine that owns the tab.
+
 No ChatGPT account screens and no usage dashboards: threads, models, reasoning levels, approvals and the browser.
 
 ## Download
