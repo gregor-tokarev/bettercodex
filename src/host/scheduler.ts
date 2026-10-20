@@ -137,7 +137,7 @@ export class Scheduler extends EventEmitter {
   constructor(
     private codex: CodexBridge,
     /** Per-thread config overrides that plug the host's MCP tools into Codex threads. */
-    private threadConfig: () => Record<string, unknown>,
+    private threadConfig: (cwd?: string | null) => Promise<Record<string, unknown>>,
   ) {
     super();
     codex.on('notification', (method: string, params: any) => this.onNotification(method, params));
@@ -426,7 +426,7 @@ export class Scheduler extends EventEmitter {
     if (loaded?.data?.includes(threadId)) return FULL;
     let res;
     try {
-      res = await this.codex.request('thread/resume', { threadId, excludeTurns: true, config: this.threadConfig() });
+      res = await this.codex.request('thread/resume', { threadId, excludeTurns: true, config: await this.threadConfig() });
     } catch (err) {
       throw new RpcError(-32004, `Thread ${threadId} was not found on ${this.hostname}: ${errorMessage(err)}`);
     }
@@ -539,7 +539,7 @@ export class Scheduler extends EventEmitter {
       model: task.model,
       approvalPolicy: 'never',
       sandbox: perms.sandbox,
-      config: this.threadConfig(),
+      config: await this.threadConfig(task.target.cwd),
     });
     run.threadId = started.thread.id as string;
     this.noteThread(run.threadId, perms.sandboxPolicy, task.target.cwd);
@@ -561,7 +561,7 @@ export class Scheduler extends EventEmitter {
       const res = await this.codex.request('thread/read', { threadId });
       return res?.thread?.status?.type ?? 'idle';
     }
-    const res = await this.codex.request('thread/resume', { threadId, excludeTurns: true, config: this.threadConfig() });
+    const res = await this.codex.request('thread/resume', { threadId, excludeTurns: true, config: await this.threadConfig() });
     this.noteThread(threadId, res?.sandbox, res?.cwd);
     return res?.thread?.status?.type ?? 'idle';
   }

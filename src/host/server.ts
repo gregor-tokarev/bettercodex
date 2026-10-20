@@ -25,6 +25,7 @@ import { SyncHub } from './browser/sync.js';
 import { BrowserTools } from './mcp/tools.js';
 import { handleMcp, MCP_SERVER_NAME, SCHEDULER_SERVER_NAME } from './mcp/server.js';
 import { ScheduleTools } from './mcp/scheduleTools.js';
+import { browseHereInstructions } from './mcp/instructions.js';
 import { Scheduler } from './scheduler.js';
 
 interface Client {
@@ -45,7 +46,7 @@ export class HostServer {
   readonly streams = new StreamHub(this.browser);
   readonly sync = new SyncHub(this.browser);
   readonly tools = new BrowserTools(this.browser);
-  readonly scheduler = new Scheduler(this.codex, () => this.threadConfig(null));
+  readonly scheduler = new Scheduler(this.codex, (cwd) => this.threadConfig(null, cwd));
   readonly scheduleTools = new ScheduleTools(
     this.scheduler,
     {
@@ -281,7 +282,7 @@ export class HostServer {
     if (method.startsWith('browser/')) return this.browserMethod(method, params);
     if (method.startsWith('schedule/')) return this.scheduler.rpc(method, params);
     const opensThread = method === 'thread/start' || method === 'thread/resume' || method === 'thread/fork';
-    if (opensThread) params = { ...params, config: this.threadConfig(params.config) };
+    if (opensThread) params = { ...params, config: await this.threadConfig(params.config, params.cwd) };
     const result = await this.codex.request(method, params);
     // The scheduler checks thread permissions before letting agents message other threads.
     if (opensThread) this.scheduler.noteThread(result?.thread?.id, result?.sandbox, result?.cwd);
@@ -290,8 +291,9 @@ export class HostServer {
   }
 
   /** Per-thread overrides that plug the host's browser tools into Codex. */
-  private threadConfig(base: Record<string, unknown> | null | undefined) {
+  private async threadConfig(base: Record<string, unknown> | null | undefined, cwd?: string | null) {
     const config: Record<string, unknown> = { ...(base ?? {}) };
+    config.developer_instructions = await this.developerInstructions(config.developer_instructions, cwd);
     const key = `mcp_servers.${MCP_SERVER_NAME}`;
     config[`${key}.url`] = `http://127.0.0.1:${this.port}/mcp`;
     config[`${key}.http_headers`] = { Authorization: `Bearer ${this.mcpToken}` };
@@ -309,6 +311,16 @@ export class HostServer {
       if (this.hasNodeRepl) config['mcp_servers.node_repl.enabled'] = false;
     }
     return config;
+  }
+
+  /** The override replaces the user's own developer instructions, so keep theirs in front of the browser rule. */
+  private async developerInstructions(base: unknown, cwd?: string | null) {
+    let own = typeof base === 'string' ? base : null;
+    if (own === null) {
+      const res = await this.codex.request('config/read', { cwd: cwd ?? null }).catch((err) => log.warn('config/read failed', errorMessage(err)));
+      own = res?.config?.developer_instructions ?? null;
+    }
+    return [own?.trim(), browseHereInstructions()].filter(Boolean).join('\n\n');
   }
 
   private async inspectCodexConfig() {

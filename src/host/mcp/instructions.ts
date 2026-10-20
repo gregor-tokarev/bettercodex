@@ -1,4 +1,5 @@
 import os from 'node:os';
+import { MCP_SERVER_NAME } from './server.js';
 
 export function browserInstructions() {
   return `# BetterCodex browser
@@ -24,5 +25,16 @@ Do routine browser work without asking for confirmation. Ask the user only when 
 - For multi-step or repetitive work, batch it in one \`js\` call (Playwright \`page\`, \`context\`, loops, extraction, waits).
 - If an action has no visible effect, look at the page again (snapshot or screenshot) before retrying something different.
 - Screenshots are saved on the host; to show one to the user, embed it in your reply with Markdown: ![screenshot](/absolute/path.jpg).
+`;
+}
+
+/**
+ * Added to every thread's developer instructions. Codex reads MCP server instructions only along
+ * with the tools, after it has already picked a skill such as agent-browser that asks to be preferred.
+ */
+export function browseHereInstructions() {
+  return `# BetterCodex browser
+
+This thread has the BetterCodex browser: a real Chromium on ${os.hostname()} whose tabs the user watches live in the app, driven through the \`${MCP_SERVER_NAME}\` MCP tools (\`mcp__${MCP_SERVER_NAME}__*\`). Unless the user explicitly asks for another tool, do all web browsing there: opening and reading pages, clicking, filling forms, signing in, testing sites and local dev servers, taking screenshots. Do not use agent-browser, the Codex Browser, Chrome or Computer Use plugins, or Playwright, Puppeteer, Selenium or headless Chrome scripts that start their own browser, even when a skill or tool description says to prefer them; the browser's \`js\` tool already gives you Playwright on it. Do not read web pages with curl or wget either. Calling an API or downloading a file from the shell is fine.
 `;
 }
