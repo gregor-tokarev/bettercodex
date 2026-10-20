@@ -1,11 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { TabInfo } from '../../shared/types';
-import { bc, isMac } from '../lib/bridge';
+import type { BrowserAction } from '../../shared/browserKeys';
+import type { PageViewRef, TabInfo } from '../../shared/types';
+import { handleBrowserActions } from '../lib/browserActions';
+import { bc } from '../lib/bridge';
 import { browserKey, conn, hostLabel, openTab, setPrefs, setState, toast, useStore, type Selection } from '../lib/store';
+import { AddressBar } from './AddressBar';
 import { BrowserViewport } from './BrowserViewport';
 import { onlyReachableThere } from '../../shared/syncPage';
-import { NativeViewport, ReplicaViewport, useReplicaStatus } from './NativeViewport';
-import { IconArrowLeft, IconArrowRight, IconChevronDown, IconExternal, IconGlobe, IconPlus, IconRefresh, IconX, Spinner } from './Icons';
+import { focusWhenShown, NativeViewport, ReplicaViewport, useReplicaStatus } from './NativeViewport';
+import { IconArrowLeft, IconArrowRight, IconChevronDown, IconChevronUp, IconExternal, IconGlobe, IconPlus, IconRefresh, IconX, Spinner } from './Icons';
+
+/** Addresses of tabs closed in each thread, newest last, for reopening them. */
+const closedTabs = new Map<string, string[]>();
+
+interface FindState {
+  open: boolean;
+  text: string;
+  matches: number;
+  active: number;
+}
 
 function Favicon({ tab }: { tab: TabInfo }) {
   const [failed, setFailed] = useState(false);
@@ -39,30 +52,50 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
   const replicaStatus = useReplicaStatus(hostId, current?.id ?? '');
   const synced = !native && remoteTabs !== 'stream' && !(current && !sameMachine && onlyReachableThere(current.url)) && !replicaStatus?.unreachable;
   const c = conn(hostId);
-  const [url, setUrl] = useState('');
-  const [editing, setEditing] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const urlRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    if (!editing) setUrl(current?.url === 'about:blank' ? '' : (current?.url ?? ''));
-  }, [current?.url, current?.id, editing]);
+  const findRef = useRef<HTMLInputElement>(null);
+  const [find, setFind] = useState<FindState>({ open: false, text: '', matches: 0, active: 0 });
+  /** Bumped to put the keyboard in the find field once it is on screen. */
+  const [findFocus, setFindFocus] = useState(0);
+  const [zoom, setZoom] = useState(1);
+  // The page view shown (this app's tab or a synced copy); a streamed tab has none here.
+  const view: PageViewRef | null = !current ? null : native ? (current.targetId ? { targetId: current.targetId } : null) : synced ? { hostId, tabId: current.id } : null;
+  const viewKey = view ? JSON.stringify(view) : '';
 
   // remember the tab the user is looking at as the thread's current tab for the agent too
   useEffect(() => {
     if (current && threadId) void c?.rpc('browser/tabs/select', { threadId, tabId: current.id }).catch(() => {});
   }, [current?.id, threadId]);
 
+  // Zoom of the page shown, kept per site like in other browsers.
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((isMac ? e.metaKey : e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'l') {
-        e.preventDefault();
-        urlRef.current?.focus();
-      }
+    setZoom(1);
+    if (!view) return;
+    let alive = true;
+    void bc.pageView.zoom(view).then((f) => alive && setZoom(f));
+    const off = bc.pageView.onZoomed((e) => setZoom(e.factor));
+    return () => {
+      alive = false;
+      off();
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  }, [viewKey, current?.url]);
+
+  useEffect(() => {
+    if (!findFocus) return;
+    findRef.current?.focus();
+    findRef.current?.select();
+  }, [findFocus]);
+
+  // Find results of the page shown; another tab closes the find bar.
+  useEffect(() => bc.pageView.onFound((r) => setFind((f) => (f.open ? { ...f, matches: r.matches, active: r.activeMatchOrdinal } : f))), []);
+  useEffect(() => {
+    const shownView = view;
+    return () => {
+      if (shownView) void bc.pageView.stopFind(shownView);
+      setFind((f) => ({ ...f, open: false, matches: 0, active: 0 }));
+    };
+  }, [viewKey]);
 
   // file inputs clicked by the user in the remote page: pick local files and upload them
   useEffect(() => {
@@ -82,7 +115,11 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
     });
   }, [c, current?.id, hostId]);
 
-  const select = (tab: TabInfo) => setState((s) => ({ browserTab: { ...s.browserTab, [key]: tab.id } }));
+  /** Shows `tab`; when the keyboard was in a page, it goes on to the page of that tab. */
+  const select = (tab: TabInfo, focusPage = false) => {
+    if (focusPage && tab.id !== current?.id) focusWhenShown(native ? (tab.targetId ?? '') : `${hostId}/${tab.id}`);
+    setState((s) => ({ browserTab: { ...s.browserTab, [key]: tab.id } }));
+  };
   const navigate = (action: string, target?: string) => {
     if (!current) {
       if (target) void openTab(selection, target);
@@ -90,6 +127,74 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
     }
     void c?.rpc('browser/tabs/navigate', { tabId: current.id, action, url: target }).catch((err) => toast(err.message));
   };
+  const focusAddress = () => {
+    urlRef.current?.focus();
+    urlRef.current?.select();
+  };
+  const closeTab = (tab: TabInfo, focusPage = false) => {
+    const i = tabs.indexOf(tab);
+    // Like other browsers: the tab to the right takes its place, or the one to the left.
+    const neighbor = tabs[i + 1] ?? tabs[i - 1];
+    if (tab.id === current?.id && neighbor) select(neighbor, focusPage);
+    if (tab.url && tab.url !== 'about:blank') closedTabs.set(key, [...(closedTabs.get(key) ?? []), tab.url].slice(-25));
+    void c?.rpc('browser/tabs/close', { tabId: tab.id }).catch((err) => toast(err.message));
+  };
+  const runFind = (text: string, forward = true, again = false) => {
+    if (view) void bc.pageView.find(view, text, { forward, again });
+  };
+  const openFind = () => {
+    if (!view) return;
+    setFind((f) => ({ ...f, open: true }));
+    setFindFocus((n) => n + 1);
+  };
+  const closeFind = () => {
+    if (view) {
+      void bc.pageView.stopFind(view);
+      void bc.pageView.focus(view);
+    }
+    setFind((f) => ({ ...f, open: false, matches: 0, active: 0 }));
+  };
+
+  const run = (action: BrowserAction, fromPage: boolean) => {
+    switch (action.type) {
+      case 'focusAddress':
+        return focusAddress();
+      case 'newTab':
+        return void openTab(selection).then(focusAddress);
+      case 'closeTab':
+        return current && closeTab(current, fromPage);
+      case 'reopenTab': {
+        const url = closedTabs.get(key)?.pop();
+        return url && void openTab(selection, url);
+      }
+      case 'nextTab':
+      case 'prevTab':
+      case 'selectTab': {
+        if (!current) return;
+        const i = tabs.indexOf(current);
+        const n = tabs.length;
+        const next = action.type === 'nextTab' ? tabs[(i + 1) % n] : action.type === 'prevTab' ? tabs[(i - 1 + n) % n] : tabs[action.index < 0 ? n - 1 : action.index];
+        return next && select(next, fromPage);
+      }
+      case 'reload':
+        return navigate('reload');
+      case 'back':
+      case 'forward':
+        return navigate(action.type);
+      case 'stop':
+        return current?.loading && navigate('stop');
+      case 'zoom':
+        return view && void bc.pageView.zoom(view, action.step).then(setZoom);
+      case 'find':
+        return openFind();
+      case 'findNext':
+        if (find.open && find.text) return runFind(find.text, !action.backwards, true);
+        return openFind();
+    }
+  };
+  const runRef = useRef(run);
+  runRef.current = run;
+  useEffect(() => handleBrowserActions((action, fromPage) => runRef.current(action, fromPage)), []);
 
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -114,7 +219,13 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
       <div className="tab-strip">
         <div className="tab-list">
           {tabs.map((t) => (
-            <div key={t.id} className={`tab ${current?.id === t.id ? 'active' : ''} ${t.agentActive ? 'agent' : ''}`} onClick={() => select(t)} title={`${t.title}\n${t.url}`}>
+            <div
+              key={t.id}
+              className={`tab ${current?.id === t.id ? 'active' : ''} ${t.agentActive ? 'agent' : ''}`}
+              onClick={() => select(t)}
+              onAuxClick={(e) => e.button === 1 && closeTab(t)}
+              title={`${t.title}\n${t.url}`}
+            >
               <Favicon tab={t} />
               <span className="tab-title">{t.title || t.url || 'New tab'}</span>
               {t.agentActive && <span className="agent-dot" title="Codex is using this tab" />}
@@ -122,14 +233,14 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
                 className="tab-close"
                 onClick={(e) => {
                   e.stopPropagation();
-                  void c?.rpc('browser/tabs/close', { tabId: t.id });
+                  closeTab(t);
                 }}
               >
                 <IconX size={11} />
               </button>
             </div>
           ))}
-          <button className="icon-button" title="New tab" onClick={() => void openTab(selection)}>
+          <button className="icon-button" title="New tab" onClick={() => void openTab(selection).then(focusAddress)}>
             <IconPlus size={14} />
           </button>
         </div>
@@ -192,33 +303,12 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
         <button className="icon-button" disabled={!current} onClick={() => navigate(current?.loading ? 'stop' : 'reload')}>
           {current?.loading ? <IconX size={14} /> : <IconRefresh size={14} />}
         </button>
-        <form
-          className="url-form"
-          onSubmit={(e) => {
-            e.preventDefault();
-            setEditing(false);
-            urlRef.current?.blur();
-            if (url.trim()) navigate('goto', url.trim());
-          }}
-        >
-          <input
-            ref={urlRef}
-            value={url}
-            placeholder="Search or enter address"
-            onFocus={(e) => {
-              setEditing(true);
-              e.currentTarget.select();
-            }}
-            onBlur={() => setEditing(false)}
-            onChange={(e) => setUrl(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') {
-                setEditing(false);
-                urlRef.current?.blur();
-              }
-            }}
-          />
-        </form>
+        <AddressBar tabId={current?.id ?? null} url={current?.url ?? ''} inputRef={urlRef} onNavigate={(target) => navigate('goto', target)} />
+        {zoom !== 1 && view && (
+          <button className="zoom-badge" title="Reset zoom" onClick={() => void bc.pageView.zoom(view, 0).then(setZoom)}>
+            {Math.round(zoom * 100)}%
+          </button>
+        )}
         {current && synced && <SyncBadge hostId={hostId} tabId={current.id} hostName={hostLabel(host)} />}
         {current && /^https?:/.test(current.url) && (
           <button className="icon-button" title="Open in system browser" onClick={() => void bc.openExternal(current.url)}>
@@ -226,6 +316,41 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
           </button>
         )}
       </div>
+      {find.open && (
+        <div className="find-bar">
+          <input
+            ref={findRef}
+            className="find-input"
+            placeholder="Find in page"
+            value={find.text}
+            spellCheck={false}
+            onChange={(e) => {
+              const text = e.target.value;
+              setFind((f) => ({ ...f, text, matches: text ? f.matches : 0, active: text ? f.active : 0 }));
+              runFind(text);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                if (find.text) runFind(find.text, !e.shiftKey, true);
+              } else if (e.key === 'Escape') {
+                e.preventDefault();
+                closeFind();
+              }
+            }}
+          />
+          <span className="find-count">{find.text ? `${find.active}/${find.matches}` : ''}</span>
+          <button className="icon-button" title="Previous match (Shift+Enter)" disabled={!find.matches} onClick={() => runFind(find.text, false, true)}>
+            <IconChevronUp size={14} />
+          </button>
+          <button className="icon-button" title="Next match (Enter)" disabled={!find.matches} onClick={() => runFind(find.text, true, true)}>
+            <IconChevronDown size={14} />
+          </button>
+          <button className="icon-button" title="Close (Esc)" onClick={closeFind}>
+            <IconX size={13} />
+          </button>
+        </div>
+      )}
       {current?.agentActive && <div className="agent-banner">Codex is using this tab</div>}
       {current?.dialog && (
         <DialogBar
@@ -238,7 +363,7 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
       ) : current && c && synced ? (
         <ReplicaViewport hostId={hostId} tab={current} hostName={hostLabel(host)} sameMachine={sameMachine} />
       ) : current && c ? (
-        <BrowserViewport key={`${hostId}:${c.port}`} connection={c} tabId={current.id} hostPlatform={host?.info?.platform ?? 'linux'} onFocusUrl={() => urlRef.current?.focus()} />
+        <BrowserViewport key={`${hostId}:${c.port}`} connection={c} tabId={current.id} hostPlatform={host?.info?.platform ?? 'linux'} />
       ) : (
         <div className="browser-empty">
           <IconGlobe size={28} />

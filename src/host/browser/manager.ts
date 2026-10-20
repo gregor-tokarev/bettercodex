@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { chromium, type Browser, type BrowserContext, type CDPSession, type Dialog, type Download, type FileChooser, type Page } from 'playwright-core';
+import { normalizeUrl } from '../../shared/address.js';
 import { SOCKET_HANDSHAKE_BYTES, SOCKET_HANDSHAKE_FRAMES, type SocketFrame } from '../../shared/syncPage.js';
 import type { AppBrowserRegistration, BrowserStatus, DownloadInfo, HostConfig, TabDialog, TabInfo } from '../../shared/types.js';
 import { isPidAlive, paths, readJson, writeJson } from '../config.js';
@@ -521,21 +522,30 @@ export class BrowserManager extends EventEmitter {
     this.changed();
   }
 
-  /** Marks a tab as being driven by the agent (shown in the UI) for the duration of `fn`. */
-  async withAgent<T>(tabId: string, fn: () => Promise<T>): Promise<T> {
+  /**
+   * Marks a tab as being driven by the agent (shown in the UI) for the duration of `fn`, or until
+   * `signal` aborts: a stopped turn lets go of the tab even while its last page call winds down.
+   */
+  async withAgent<T>(tabId: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const tab = this.tabs.get(tabId);
+    let held = !!tab;
+    const release = () => {
+      if (!held || !tab) return;
+      held = false;
+      tab.agentCalls--;
+      tab.lastActiveAt = Date.now();
+      this.changed();
+    };
     if (tab) {
       tab.agentCalls++;
       this.changed();
     }
+    signal?.addEventListener('abort', release, { once: true });
     try {
       return await fn();
     } finally {
-      if (tab) {
-        tab.agentCalls--;
-        tab.lastActiveAt = Date.now();
-        this.changed();
-      }
+      signal?.removeEventListener('abort', release);
+      release();
     }
   }
 
@@ -927,14 +937,3 @@ function uniquePath(dir: string, filename: string) {
 
 /** The app could not be started on this machine (as opposed to a running app being unreachable). */
 class AppUnavailable extends Error {}
-
-export function normalizeUrl(input: string) {
-  const url = input.trim();
-  if (!url) return 'about:blank';
-  // host:port first, otherwise "localhost:3000" would look like a URL with scheme "localhost".
-  if (/^(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:\d+)?([/?#]|$)/i.test(url)) return `http://${url}`;
-  if (/^[\w.-]+:\d+([/?#]|$)/.test(url)) return `http://${url}`;
-  if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return url;
-  if (/^[^\s/]+\.[^\s/]{2,}([/?#].*)?$/.test(url)) return `https://${url}`;
-  return `https://www.google.com/search?q=${encodeURIComponent(url)}`;
-}

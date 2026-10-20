@@ -33,8 +33,46 @@ function safeJson(s: string) {
   }
 }
 
+/**
+ * Tool calls in flight, by turn. Codex does not cancel the calls of a turn it stops (their requests
+ * stay open), so they are ended here once Codex reports the turn over.
+ */
+export class TurnCalls {
+  private calls = new Map<string, Set<AbortController>>();
+
+  /** A signal for one call that aborts when the request goes away or its turn ends. */
+  track(turnId: string | null, request: AbortSignal) {
+    const call = new AbortController();
+    const abort = () => call.abort();
+    if (request.aborted) call.abort();
+    request.addEventListener('abort', abort, { once: true });
+    if (turnId) {
+      let set = this.calls.get(turnId);
+      if (!set) this.calls.set(turnId, (set = new Set()));
+      set.add(call);
+    }
+    const done = () => {
+      request.removeEventListener('abort', abort);
+      const set = turnId ? this.calls.get(turnId) : undefined;
+      set?.delete(call);
+      if (set && !set.size) this.calls.delete(turnId!);
+    };
+    return { signal: call.signal, done };
+  }
+
+  ended(turnId: string) {
+    const set = this.calls.get(turnId);
+    this.calls.delete(turnId);
+    for (const call of set ?? []) call.abort();
+  }
+
+  endAll() {
+    for (const turnId of [...this.calls.keys()]) this.ended(turnId);
+  }
+}
+
 /** Stateless Streamable-HTTP MCP endpoint: every POST gets a fresh server bound to the shared tools. */
-export async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, tools: ToolServer) {
+export async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, tools: ToolServer, turns: TurnCalls) {
   if (req.method !== 'POST') {
     res.writeHead(405, { Allow: 'POST' }).end();
     return;
@@ -50,12 +88,17 @@ export async function handleMcp(req: http.IncomingMessage, res: http.ServerRespo
   }
   const server = new Server({ name: `bettercodex-${tools.name}`, version: HOST_VERSION }, { capabilities: { tools: {} }, instructions: tools.instructions() });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools.list() as any }));
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const ctx = contextFrom(request.params._meta);
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    const meta = contextFrom(request.params._meta);
+    const call = turns.track(meta.turnId, extra.signal);
     const started = Date.now();
-    const result = await tools.call(request.params.name, request.params.arguments, ctx);
-    log.debug(`tool ${request.params.name} thread=${ctx.threadId} ${Date.now() - started}ms${result.isError ? ' (error)' : ''}`);
-    return result as any;
+    try {
+      const result = await tools.call(request.params.name, request.params.arguments, { ...meta, signal: call.signal });
+      log.debug(`tool ${request.params.name} thread=${meta.threadId} ${Date.now() - started}ms${result.isError ? ' (error)' : ''}`);
+      return result as any;
+    } finally {
+      call.done();
+    }
   });
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   res.on('close', () => {

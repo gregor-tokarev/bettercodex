@@ -16,14 +16,14 @@ import {
   type RelayMachine,
   type RelayRequest,
 } from '../shared/types.js';
-import { CodexBridge, RpcError } from './codex.js';
+import { CodexBridge, RpcError, TIMEOUT } from './codex.js';
 import { loadConfig, paths, readJson, saveConfig, writeJson } from './config.js';
 import { errorMessage, log } from './log.js';
 import { BrowserManager } from './browser/manager.js';
 import { StreamHub } from './browser/stream.js';
 import { SyncHub } from './browser/sync.js';
 import { BrowserTools } from './mcp/tools.js';
-import { handleMcp, MCP_SERVER_NAME, SCHEDULER_SERVER_NAME } from './mcp/server.js';
+import { handleMcp, MCP_SERVER_NAME, SCHEDULER_SERVER_NAME, TurnCalls } from './mcp/server.js';
 import { ScheduleTools } from './mcp/scheduleTools.js';
 import { browseHereInstructions } from './mcp/instructions.js';
 import { Scheduler } from './scheduler.js';
@@ -55,6 +55,8 @@ export class HostServer {
     },
     this.codex,
   );
+  /** Tool calls in flight per turn, ended when the turn is (Codex leaves a stopped turn's calls open). */
+  private readonly turnCalls = new TurnCalls();
   private clients = new Set<Client>();
   private relays = new Map<number, { client: Client; resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
   private nextRelayId = 1;
@@ -70,9 +72,13 @@ export class HostServer {
     private clientToken: string,
     private mcpToken: string,
   ) {
-    this.codex.on('notification', (method: string, params: unknown) => this.broadcast({ t: 'notif', method, params }));
+    this.codex.on('notification', (method: string, params: any) => {
+      if (method === 'turn/completed' && params?.turn?.id) this.turnCalls.ended(params.turn.id);
+      this.broadcast({ t: 'notif', method, params });
+    });
     this.codex.on('serverRequest', (req) => this.broadcast({ t: 'req', id: req.id, method: req.method, params: req.params }));
     this.codex.on('status', () => {
+      if (this.codex.status !== 'ready') this.turnCalls.endAll();
       this.broadcast({ t: 'notif', method: 'host/info', params: this.info() });
       if (this.codex.status === 'ready') void this.inspectCodexConfig();
     });
@@ -170,7 +176,7 @@ export class HostServer {
       }
       if (url.pathname === '/mcp' || url.pathname === `/mcp/${SCHEDULER_SERVER_NAME}`) {
         if (!this.authorized(req, this.mcpToken)) return json(res, 401, { error: 'unauthorized' });
-        return await handleMcp(req, res, url.pathname === '/mcp' ? this.tools : this.scheduleTools);
+        return await handleMcp(req, res, url.pathname === '/mcp' ? this.tools : this.scheduleTools, this.turnCalls);
       }
       if (!this.authorized(req, this.clientToken)) return json(res, 401, { error: 'unauthorized' });
       if (url.pathname === '/file' && req.method === 'GET') {
@@ -283,12 +289,42 @@ export class HostServer {
     if (method.startsWith('host/')) return this.hostMethod(method, params);
     if (method.startsWith('browser/')) return this.browserMethod(method, params);
     if (method.startsWith('schedule/')) return this.scheduler.rpc(method, params);
+    if (method === 'turn/interrupt') return this.interrupt(params);
     const opensThread = method === 'thread/start' || method === 'thread/resume' || method === 'thread/fork';
     const result = opensThread ? await this.openThread(method, params) : await this.codex.request(method, params);
     // The scheduler checks thread permissions before letting agents message other threads.
     if (opensThread) this.scheduler.noteThread(result?.thread?.id, result?.sandbox, result?.cwd);
     else if (method === 'turn/start' || method === 'thread/settings/update') this.scheduler.noteThread(params.threadId, params.sandboxPolicy, params.cwd);
     return result;
+  }
+
+  /**
+   * Stops the turn running in a thread. The app's idea of which turn runs can be out of date (an
+   * event missed while reconnecting, a turn started by a scheduled task), so whatever turn Codex
+   * reports as running is the one stopped. `idle` means nothing was running at all, which lets the
+   * app drop a "working" state that no longer matches Codex.
+   */
+  private async interrupt(params: { threadId: string; turnId?: string }) {
+    let turnId = params.turnId ?? '';
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        // Codex answers once the turn has actually stopped; a turn that ended meanwhile gets no answer.
+        await this.codex.request('turn/interrupt', { threadId: params.threadId, turnId }, 10_000);
+        return { idle: false };
+      } catch (err) {
+        const message = errorMessage(err);
+        const running = /but found (\S+)/.exec(message)?.[1];
+        if (running && running !== turnId) {
+          turnId = running;
+          continue;
+        }
+        if (/no active turn|thread not found|not loaded/i.test(message)) return { idle: true };
+        if ((err as RpcError).code !== TIMEOUT) throw err;
+        const res = await this.codex.request('thread/read', { threadId: params.threadId }).catch(() => null);
+        return { idle: res?.thread?.status?.type !== 'active' };
+      }
+    }
+    throw new RpcError(-32000, 'The running turn kept changing; try again');
   }
 
   /**

@@ -9,6 +9,9 @@ import { errorMessage, log } from './log.js';
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: RpcError) => void; method: string };
 
+/** Error code of a request that got no answer in time. */
+export const TIMEOUT = -32001;
+
 export class RpcError extends Error {
   constructor(
     public code: number,
@@ -125,12 +128,13 @@ export class CodexBridge extends EventEmitter {
     return new Promise((resolve) => this.readyWaiters.push(resolve));
   }
 
-  async request<T = any>(method: string, params?: unknown): Promise<T> {
+  /** `timeoutMs` gives up waiting (with a `TIMEOUT` error) for calls Codex may never answer. */
+  async request<T = any>(method: string, params?: unknown, timeoutMs?: number): Promise<T> {
     if (this.status !== 'ready') {
       if (this.status === 'error') throw new RpcError(-32000, this.error ?? 'codex is not available');
       await this.whenReady();
     }
-    return this.send(method, params) as Promise<T>;
+    return this.send(method, params, timeoutMs) as Promise<T>;
   }
 
   /** Answer a server-initiated request (approvals, user input, elicitation). */
@@ -141,10 +145,26 @@ export class CodexBridge extends EventEmitter {
     return true;
   }
 
-  private send(method: string, params?: unknown) {
+  private send(method: string, params?: unknown, timeoutMs?: number) {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
+      const timer = timeoutMs
+        ? setTimeout(() => {
+            this.pending.delete(id);
+            reject(new RpcError(TIMEOUT, `${method} got no answer in ${timeoutMs}ms`));
+          }, timeoutMs)
+        : null;
+      this.pending.set(id, {
+        resolve: (v) => {
+          if (timer) clearTimeout(timer);
+          resolve(v);
+        },
+        reject: (e) => {
+          if (timer) clearTimeout(timer);
+          reject(e);
+        },
+        method,
+      });
       this.write({ jsonrpc: '2.0', id, method, params });
     });
   }

@@ -4,8 +4,9 @@ import { ScheduledView, TaskEditor } from './components/Scheduled';
 import { Settings } from './components/Settings';
 import { Sidebar } from './components/Sidebar';
 import { ThreadView } from './components/ThreadView';
-import { getState, openThread, setPrefs, setState, useStore } from './lib/store';
+import { getState, interrupt, openThread, setPrefs, setState, threadKey, useStore } from './lib/store';
 import { bc, isMac } from './lib/bridge';
+import { browserKeyDown, inBrowserPanel } from './lib/browserActions';
 
 export function App() {
   const selection = useStore((s) => s.selection);
@@ -21,9 +22,20 @@ export function App() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (browserKeyDown(e)) return;
       const mod = isMac ? e.metaKey : e.ctrlKey;
-      if (!mod) return;
       const sel = getState().selection;
+      // Esc stops Codex when nothing else on screen wants it (a menu, a dialog, a text field, the browser).
+      if (e.key === 'Escape' && !mod && !e.defaultPrevented && !e.isComposing && !inBrowserPanel() && sel?.threadId && getState().view === 'thread') {
+        const el = document.activeElement as HTMLElement | null;
+        const typing = !!el && (el.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName));
+        if (!typing && !document.querySelector('.popover, .modal-backdrop') && getState().threads[threadKey(sel.hostId, sel.threadId)]?.activeTurnId) {
+          e.preventDefault();
+          void interrupt(sel.hostId, sel.threadId);
+        }
+        return;
+      }
+      if (!mod) return;
       if (e.key.toLowerCase() === 'n' && sel) {
         e.preventDefault();
         void openThread(sel.hostId, null);

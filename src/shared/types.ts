@@ -290,3 +290,12 @@ export interface UpdateStatus {
   installError: string | null;
   checkedAt: number | null;
 }
+
+/** A page view the app shows: a tab of its own browser, or a synced copy of another machine's tab. */
+export type PageViewRef = { targetId: string } | { hostId: string; tabId: string };
+
+/** Search suggestions for what is typed in the address bar. */
+export interface Suggestions {
+  queries: string[];
+  links: Array<{ url: string; title: string }>;
+}

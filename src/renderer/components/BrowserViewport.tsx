@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { FrameHeader, StreamClientMessage, StreamHostMessage } from '../../shared/types';
+import { browserAction, type BrowserAction } from '../../shared/browserKeys';
 import { bc, isMac } from '../lib/bridge';
 import type { HostConnection } from '../lib/connection';
 import { Spinner } from './Icons';
@@ -10,11 +11,14 @@ function modifiers(e: { altKey: boolean; ctrlKey: boolean; metaKey: boolean; shi
 
 const BUTTONS = ['left', 'middle', 'right', 'back', 'forward'] as const;
 
+/** Browser shortcuts the panel handles for a streamed tab; other keys (Esc, find, zoom) go to the page. */
+const PANEL_KEYS = new Set<BrowserAction['type']>(['focusAddress', 'newTab', 'closeTab', 'reopenTab', 'nextTab', 'prevTab', 'selectTab', 'reload', 'back', 'forward']);
+
 /**
  * Live view of one remote tab: draws screencast frames on a canvas and forwards
  * mouse, wheel, keyboard, IME and clipboard input to the host's browser.
  */
-export function BrowserViewport({ connection, tabId, hostPlatform, onFocusUrl }: { connection: HostConnection; tabId: string; hostPlatform: string; onFocusUrl: () => void }) {
+export function BrowserViewport({ connection, tabId, hostPlatform }: { connection: HostConnection; tabId: string; hostPlatform: string }) {
   const container = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
@@ -218,11 +222,9 @@ export function BrowserViewport({ connection, tabId, hostPlatform, onFocusUrl }:
     if (e.nativeEvent.isComposing || e.keyCode === 229) return; // IME composition in progress
     const shortcut = isMac ? e.metaKey : e.ctrlKey;
     const lower = keyName(e).toLowerCase();
-    if (shortcut && lower === 'l') {
-      e.preventDefault();
-      onFocusUrl();
-      return;
-    }
+    // Left alone here, the key reaches the app window, which runs it in the browser panel.
+    const action = browserAction({ key: e.key, code: e.code, ctrl: e.ctrlKey, meta: e.metaKey, alt: e.altKey, shift: e.shiftKey }, isMac);
+    if (action && PANEL_KEYS.has(action.type)) return;
     if (shortcut && lower === 'v' && !e.shiftKey) {
       e.preventDefault();
       const text = await bc.clipboard.read();

@@ -1,6 +1,7 @@
 // Typed access to the API exposed by the Electron preload script.
 
-import type { UpdateStatus } from '../../shared/types';
+import type { BrowserAction } from '../../shared/browserKeys';
+import type { PageViewRef, Suggestions, UpdateStatus } from '../../shared/types';
 
 export interface HostEntry {
   id: string;
@@ -69,6 +70,21 @@ interface Bridge {
     restart(): Promise<void>;
     onStatus(cb: (status: UpdateStatus) => void): () => void;
   };
+  /** Find, zoom and focus in the page view the browser panel shows. */
+  pageView: {
+    /** Searches the page (`again`: goes to the next match of the same search); results arrive through `onFound`. */
+    find(view: PageViewRef, text: string, opts: { forward?: boolean; again?: boolean }): Promise<number | null>;
+    stopFind(view: PageViewRef): Promise<void>;
+    /** Changes the zoom by `step` (0 resets it); without a step it only reports it. */
+    zoom(view: PageViewRef, step?: 1 | -1 | 0): Promise<number>;
+    focus(view: PageViewRef): Promise<void>;
+    onFound(cb: (r: { requestId: number; matches: number; activeMatchOrdinal: number; finalUpdate: boolean }) => void): () => void;
+    /** The page shown was zoomed with the keyboard. */
+    onZoomed(cb: (e: { factor: number }) => void): () => void;
+  };
+  suggest(text: string): Promise<Suggestions>;
+  /** Browser shortcuts pressed while a page view has the keyboard. */
+  onBrowserAction(cb: (action: BrowserAction) => void): () => void;
   onShortcut(cb: (e: { key: string; shift: boolean }) => void): () => void;
   openExternal(url: string): Promise<void>;
   appInfo(): Promise<{ platform: string; version: string; instanceId: string }>;

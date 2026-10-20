@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { bc } from '../lib/bridge';
 import { effectiveSettings, interrupt, sendMessage, setComposerSetting, toast, useStore, type AccessMode } from '../lib/store';
 import { HostImage } from './Items';
-import { IconArrowUp, IconBrain, IconPaperclip, IconShield, IconSparkle, IconStop, IconX } from './Icons';
+import { IconArrowUp, IconBrain, IconPaperclip, IconShield, IconSparkle, IconStop, IconX, Spinner } from './Icons';
 import { Dropdown } from './Menu';
 import { SendLater } from './Scheduled';
 
@@ -35,6 +35,7 @@ export function Composer({ hostId, threadId, children }: { hostId: string; threa
   useStore((s) => s.threadSettings);
   useStore((s) => s.prefs);
   const running = useStore((s) => (threadId ? !!s.threads[`${hostId}:${threadId}`]?.activeTurnId : false));
+  const stopping = useStore((s) => (threadId ? !!s.threads[`${hostId}:${threadId}`]?.stopping : false));
   const usage = useStore((s) => (threadId ? s.threads[`${hostId}:${threadId}`]?.tokenUsage : null));
   const settings = effectiveSettings(hostId, threadId);
   const model = models.find((m) => m.model === settings.model);
@@ -118,9 +119,14 @@ export function Composer({ hostId, threadId, children }: { hostId: string; threa
           }}
           onPaste={onPaste}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+            if (e.nativeEvent.isComposing) return;
+            if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();
               void submit();
+            } else if (e.key === 'Escape' && running && threadId) {
+              // Esc stops Codex, like in the Codex CLI; the draft stays.
+              e.preventDefault();
+              void interrupt(hostId, threadId);
             }
           }}
         />
@@ -173,12 +179,22 @@ export function Composer({ hostId, threadId, children }: { hostId: string; threa
               <span>{contextPct}%</span>
             </span>
           )}
-          {running && !text.trim() ? (
-            <button className="send-button stop" title="Stop" onClick={() => threadId && void interrupt(hostId, threadId)}>
-              <IconStop size={14} />
+          {running && (
+            <button
+              className={`send-button stop ${stopping ? 'stopping' : ''}`}
+              title={stopping ? 'Stopping… (click to try again)' : 'Stop (Esc)'}
+              onClick={() => threadId && void interrupt(hostId, threadId)}
+            >
+              {stopping ? <Spinner size={14} /> : <IconStop size={14} />}
             </button>
-          ) : (
-            <button className="send-button" title="Send" disabled={(!text.trim() && !images.length) || sending} onClick={() => void submit()}>
+          )}
+          {(!running || text.trim() || images.length > 0) && (
+            <button
+              className="send-button"
+              title={running ? 'Send to the running turn' : 'Send'}
+              disabled={(!text.trim() && !images.length) || sending}
+              onClick={() => void submit()}
+            >
               <IconArrowUp size={16} />
             </button>
           )}

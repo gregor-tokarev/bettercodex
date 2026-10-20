@@ -3,6 +3,17 @@
 // dialog functions through the main process instead, which hands them to the host like Chrome would.
 import { contextBridge, ipcRenderer } from 'electron';
 
+// The mouse's back and forward buttons navigate, like in any browser (Chromium does it itself elsewhere).
+if (process.platform === 'darwin') {
+  addEventListener(
+    'mouseup',
+    (e) => {
+      if (e.isTrusted && (e.button === 3 || e.button === 4)) ipcRenderer.send('bc:nav', e.button === 3 ? 'back' : 'forward');
+    },
+    true,
+  );
+}
+
 contextBridge.exposeInMainWorld('__bettercodexDialog', (type: string, message: unknown, defaultValue: unknown) =>
   ipcRenderer.sendSync('bc:dialog', {
     type,

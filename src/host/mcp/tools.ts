@@ -20,6 +20,8 @@ export interface ToolContext {
   turnId: string | null;
   /** The thread's Codex sandbox ("read-only", "workspace-write", "danger-full-access"). */
   sandboxMode?: string | null;
+  /** Aborts when Codex gives up on the call (the turn was stopped). */
+  signal?: AbortSignal;
 }
 
 interface ToolDef {
@@ -73,6 +75,11 @@ export class BrowserTools {
   }
 
   // ---------- helpers ----------
+
+  /** Shows the tab as driven by Codex while `fn` runs, or until Codex gives up on the call. */
+  private withAgent<T>(ctx: ToolContext, tabId: string, fn: () => Promise<T>) {
+    return this.browser.withAgent(tabId, fn, ctx.signal);
+  }
 
   private async tabFor(ctx: ToolContext, tabId?: string, { create = false } = {}) {
     let id = tabId || this.browser.currentTabId(ctx.threadId);
@@ -233,7 +240,7 @@ export class BrowserTools {
           if (action === 'new') {
             const tab = await this.browser.newTab(ctx.threadId, undefined, 'agent');
             const page = await this.browser.page(tab.id);
-            if (args.url) await this.browser.withAgent(tab.id, () => this.browser.goto(tab, args.url));
+            if (args.url) await this.withAgent(ctx, tab.id, () => this.browser.goto(tab, args.url));
             return { content: [text(await this.describe(tab.id, page, { snapshot: !!args.url }))] };
           }
           if (action === 'select' || action === 'claim') {
@@ -284,11 +291,11 @@ export class BrowserTools {
           if (args.newTab && args.url) {
             const tab = await this.browser.newTab(ctx.threadId, undefined, 'agent');
             const page = await this.browser.page(tab.id);
-            await this.browser.withAgent(tab.id, () => this.browser.goto(tab, args.url));
+            await this.withAgent(ctx, tab.id, () => this.browser.goto(tab, args.url));
             return { content: [text(await this.describe(tab.id, page, { snapshot: args.snapshot !== false }))] };
           }
           const { tab, page } = await this.tabFor(ctx, args.tabId, { create: true });
-          return this.browser.withAgent(tab.id, async () => {
+          return this.withAgent(ctx, tab.id, async () => {
             const { dialog } = await this.act(tab.id, async () => {
               if (action === 'back') await page.goBack({ waitUntil: 'domcontentloaded', timeout: 30000 });
               else if (action === 'forward') await page.goForward({ waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -355,7 +362,7 @@ export class BrowserTools {
         run: async (args, ctx) => {
           const { tab, page } = await this.tabFor(ctx, args.tabId);
           const before = this.threadTabIds(ctx);
-          return this.browser.withAgent(tab.id, async () => {
+          return this.withAgent(ctx, tab.id, async () => {
             const target = this.locate(page, args);
             const opts = { button: args.button ?? 'left', modifiers: args.modifiers, timeout: 10000 };
             if (!target && (typeof args.x !== 'number' || typeof args.y !== 'number')) throw new Error('Pass ref, selector or x/y');
@@ -395,7 +402,7 @@ export class BrowserTools {
         run: async (args, ctx) => {
           const { tab, page } = await this.tabFor(ctx, args.tabId);
           const before = this.threadTabIds(ctx);
-          return this.browser.withAgent(tab.id, async () => {
+          return this.withAgent(ctx, tab.id, async () => {
             const target = this.locate(page, args);
             const { dialog } = await this.act(tab.id, async () => {
               if (target) {
@@ -423,7 +430,7 @@ export class BrowserTools {
         run: async (args, ctx) => {
           const { tab, page } = await this.tabFor(ctx, args.tabId);
           const before = this.threadTabIds(ctx);
-          return this.browser.withAgent(tab.id, async () => {
+          return this.withAgent(ctx, tab.id, async () => {
             const target = this.locate(page, args);
             const { dialog } = await this.act(tab.id, async () => {
               if (target) await target.press(args.key, { timeout: 10000 });
@@ -443,7 +450,7 @@ export class BrowserTools {
         },
         run: async (args, ctx) => {
           const { tab, page } = await this.tabFor(ctx, args.tabId);
-          return this.browser.withAgent(tab.id, async () => {
+          return this.withAgent(ctx, tab.id, async () => {
             const target = this.locate(page, args);
             const { dialog } = await this.act(tab.id, async () => {
               if (target) await target.hover({ timeout: 10000 });
@@ -472,7 +479,7 @@ export class BrowserTools {
         },
         run: async (args, ctx) => {
           const { tab, page } = await this.tabFor(ctx, args.tabId);
-          return this.browser.withAgent(tab.id, async () => {
+          return this.withAgent(ctx, tab.id, async () => {
             const target = this.locate(page, args);
             const viewport = page.viewportSize() ?? (await page.evaluate(() => ({ width: innerWidth, height: innerHeight })).catch(() => ({ width: 1280, height: 800 })));
             if (target && !args.direction) {
@@ -511,7 +518,7 @@ export class BrowserTools {
         },
         run: async (args, ctx) => {
           const { tab, page } = await this.tabFor(ctx, args.tabId);
-          return this.browser.withAgent(tab.id, async () => {
+          return this.withAgent(ctx, tab.id, async () => {
             const target = this.locate(page, args);
             if (!target) throw new Error('Pass ref or selector');
             const { dialog, value: chosen } = await this.act(tab.id, () => target.selectOption(args.values, { timeout: 10000 }));
@@ -532,7 +539,7 @@ export class BrowserTools {
         },
         run: async (args, ctx) => {
           const { tab, page } = await this.tabFor(ctx, args.tabId);
-          return this.browser.withAgent(tab.id, async () => {
+          return this.withAgent(ctx, tab.id, async () => {
             const target = this.locate(page, args);
             const isFn = /^\s*(async\s+)?(\(|function\b|[\w$]+\s*=>)/.test(args.script);
             const { dialog, value } = await this.act(tab.id, async (): Promise<unknown> => {
@@ -569,7 +576,7 @@ export class BrowserTools {
         run: async (args, ctx) => {
           const { tab, page } = await this.tabFor(ctx, args.tabId);
           const timeout = Math.min(args.timeout ?? 15, 120) * 1000;
-          return this.browser.withAgent(tab.id, async () => {
+          return this.withAgent(ctx, tab.id, async () => {
             if (args.seconds) await page.waitForTimeout(Math.min(args.seconds, 120) * 1000);
             if (args.text) await page.getByText(args.text).first().waitFor({ state: 'visible', timeout });
             if (args.textGone) await page.getByText(args.textGone).first().waitFor({ state: 'hidden', timeout });
@@ -630,7 +637,7 @@ export class BrowserTools {
         run: async (args, ctx) => {
           const { tab, page } = await this.tabFor(ctx, args.tabId);
           for (const file of args.paths) if (!fs.existsSync(file)) throw new Error(`File not found on host: ${file}`);
-          return this.browser.withAgent(tab.id, async () => {
+          return this.withAgent(ctx, tab.id, async () => {
             const target = this.locate(page, args);
             if (!target) {
               await this.browser.resolveFileChooser(tab.id, args.paths);
@@ -700,7 +707,7 @@ export class BrowserTools {
             };
             this.browser.on('dialog', onDialog);
           });
-          const running = currentId ? this.browser.withAgent(currentId, run) : run();
+          const running = currentId ? this.withAgent(ctx, currentId, run) : run();
           const winner = await Promise.race([running, dialogOpened]).finally(() => this.browser.off('dialog', onDialog));
           if (!('text' in winner)) {
             return {

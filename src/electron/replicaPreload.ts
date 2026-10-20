@@ -21,6 +21,17 @@ for (const type of ['pointerdown', 'keydown', 'beforeinput', 'input', 'change', 
   );
 }
 
+// The mouse's back and forward buttons navigate, like in any browser (Chromium does it itself elsewhere).
+if (process.platform === 'darwin') {
+  addEventListener(
+    'mouseup',
+    (e) => {
+      if (e.isTrusted && (e.button === 3 || e.button === 4)) ipcRenderer.send('bc:nav', e.button === 3 ? 'back' : 'forward');
+    },
+    true,
+  );
+}
+
 // localStorage of the other machine is in place before the page's own scripts run.
 const seed = ipcRenderer.sendSync('bc:replica-seed', location.origin) as Record<string, string> | null;
 if (seed) {

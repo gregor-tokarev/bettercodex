@@ -2,11 +2,13 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, shel
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import type { AppBrowserRegistration } from '../shared/types.js';
+import { nextZoom } from '../shared/browserKeys.js';
+import type { AppBrowserRegistration, PageViewRef } from '../shared/types.js';
 import { AppBrowser } from './appBrowser.js';
 import { HostManager, type HostEntry } from './hosts.js';
 import { ReplicaManager } from './replicas.js';
 import { ViewStage, type Rect } from './stage.js';
+import { fetchSuggestions } from './suggest.js';
 import { Updater } from './updater.js';
 
 const distDir = path.resolve(__dirname, '..');
@@ -224,6 +226,29 @@ function boot() {
   ipcMain.handle('replica:status', (_e, hostId: string, tabId: string) => replicas.statusOf(hostId, tabId));
   replicas.on('status', (status) => send('replica:status', status));
 
+  // The browser panel's find bar, zoom and focus act on the page view it shows.
+  const pageOf = (view: PageViewRef) => ('targetId' in view ? appBrowser.contentsFor(view.targetId) : replicas.contents(view.hostId, view.tabId));
+  ipcMain.handle('pageView:find', (_e, view: PageViewRef, text: string, opts: { forward?: boolean; again?: boolean }) => {
+    const wc = pageOf(view);
+    if (!wc) return null;
+    if (!text) {
+      wc.stopFindInPage('clearSelection');
+      return null;
+    }
+    // Electron's `findNext` starts a new search; stepping through the matches of one leaves it off.
+    return wc.findInPage(text, { forward: opts?.forward ?? true, findNext: !opts?.again });
+  });
+  ipcMain.handle('pageView:stopFind', (_e, view: PageViewRef) => pageOf(view)?.stopFindInPage('clearSelection'));
+  /** Changes the zoom by `step` (0 resets it) or just reports it. */
+  ipcMain.handle('pageView:zoom', (_e, view: PageViewRef, step?: 1 | -1 | 0) => {
+    const wc = pageOf(view);
+    if (!wc) return 1;
+    if (step !== undefined) wc.setZoomFactor(nextZoom(wc.getZoomFactor(), step));
+    return wc.getZoomFactor();
+  });
+  ipcMain.handle('pageView:focus', (_e, view: PageViewRef) => pageOf(view)?.focus());
+  ipcMain.handle('suggest:query', (_e, text: string) => fetchSuggestions(text));
+
   /** Lets the user pick local files and copies them to the host, returning host-side paths. */
   ipcMain.handle('files:pickAndUpload', async (_e, hostId: string, opts: { multiple?: boolean; images?: boolean }) => {
     const result = await dialog.showOpenDialog(win!, {
@@ -286,7 +311,11 @@ function boot() {
         Menu.buildFromTemplate([
           { role: 'appMenu' },
           { role: 'editMenu' },
-          { role: 'viewMenu' },
+          // No Reload items: Cmd+R reloads the page in the browser panel, not the app.
+          {
+            label: 'View',
+            submenu: [{ role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }, { role: 'toggleDevTools' }],
+          },
           { role: 'windowMenu' },
         ]),
       );
