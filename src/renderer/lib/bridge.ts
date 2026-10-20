@@ -25,6 +25,8 @@ export interface ReplicaStatus {
   status: 'connecting' | 'loading' | 'synced' | 'syncing' | 'offline' | 'gone';
   error: string | null;
   pending: number;
+  /** This machine cannot load the page (only the owning machine reaches it): it is streamed. */
+  unreachable?: boolean;
 }
 
 interface Bridge {

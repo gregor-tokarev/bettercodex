@@ -131,7 +131,7 @@ export function useReplicaStatus(hostId: string, tabId: string) {
     let alive = true;
     void bc.replica.status(hostId, tabId).then((s) => alive && s && setStatus(s));
     const off = bc.replica.onStatus((s) => {
-      if (s.hostId === hostId && s.tabId === tabId) setStatus({ status: s.status, error: s.error, pending: s.pending });
+      if (s.hostId === hostId && s.tabId === tabId) setStatus({ status: s.status, error: s.error, pending: s.pending, unreachable: s.unreachable });
     });
     return () => {
       alive = false;

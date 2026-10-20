@@ -2,11 +2,15 @@ import type { CDPSession, ElementHandle, Frame, Page, Request, Response } from '
 import type { WebSocket } from 'ws';
 import {
   ACTION_WINDOW_MS,
+  indexedDbOp,
   installSyncRecorder,
+  requestIdentity,
   requestKey,
   sameDocument,
   syncPageOp,
   type FrameRef,
+  type IndexedDbDump,
+  type SocketEvent,
   type SyncAction,
   type SyncClientMessage,
   type SyncCookie,
@@ -22,6 +26,7 @@ const WORLD = 'bettercodex-sync';
 const BINDING = '__bettercodexSyncEmit';
 const RECORDER = `(${installSyncRecorder.toString()})((json) => ${BINDING}(json), false)`;
 const PAGE_OP = syncPageOp.toString();
+const IDB_OP = indexedDbOp.toString();
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 /** What the page does right after a replayed action is that action's doing, not news. */
 const REPLAY_TAIL_MS = 600;
@@ -36,6 +41,8 @@ interface Client {
   cookies: Map<string, string> | null;
   /** Last localStorage sent per tab. */
   storage: Map<string, string>;
+  /** Origin and IndexedDB last read for this client, per tab. */
+  indexedDB: Map<string, { origin: string; json: string }>;
 }
 
 interface TabSync {
@@ -60,6 +67,9 @@ interface TabSync {
   publishTimer: NodeJS.Timeout | null;
   publishDeadline: number;
   cleanups: Array<() => void>;
+  requestSeq: number;
+  /** The frame showing the page's dialog, if one is open. */
+  dialogUrl: string;
 }
 
 /**
@@ -78,10 +88,20 @@ export class SyncHub {
         else if (ts.page && (ts.page.isClosed() || this.browser.get(ts.tabId)?.page !== ts.page)) this.end(ts, 'The tab went to sleep');
       }
     });
+    // Copies never connect WebSockets themselves; they get what the owner's page receives.
+    browser.on('socket', (e: { tabId: string; id: string } & SocketEvent) => {
+      const ts = this.tabs.get(e.tabId);
+      if (ts) this.broadcast(ts, { t: 'socket', ...e }, null);
+    });
+    // A copy runs the same dialog and waits for the answer given here (see instrument for openings).
+    browser.on('dialogClosed', (e: { tabId: string; type: string; message: string; accept: boolean; promptText: string | null }) => {
+      const ts = this.tabs.get(e.tabId);
+      if (ts) this.broadcast(ts, { t: 'dialog', tabId: e.tabId, open: false, type: e.type, message: e.message, url: ts.dialogUrl, accept: e.accept, value: e.promptText }, null);
+    });
   }
 
   handle(ws: WebSocket) {
-    const client: Client = { ws, tabs: new Set(), cookies: null, storage: new Map() };
+    const client: Client = { ws, tabs: new Set(), cookies: null, storage: new Map(), indexedDB: new Map() };
     ws.on('message', (data, isBinary) => {
       if (isBinary) return;
       let msg: SyncClientMessage;
@@ -123,6 +143,8 @@ export class SyncHub {
         publishTimer: null,
         publishDeadline: 0,
         cleanups: [],
+        requestSeq: 0,
+        dialogUrl: '',
       };
       this.tabs.set(tabId, ts);
     }
@@ -133,11 +155,12 @@ export class SyncHub {
       ts.ready ??= this.instrument(ts);
       await ts.ready;
       if (ts.dead || !ts.subscribers.has(client)) return;
-      const state = await this.state(ts, client, true);
+      const state = await this.state(ts, client, true, await this.indexedDb(ts));
       const cookies = await this.cookies();
       if (ts.dead || !ts.subscribers.has(client)) return;
       client.cookies = new Map(cookies.map((c) => [cookieKey(c), JSON.stringify(c)]));
-      send(client, { t: 'snapshot', tabId, state, cookies });
+      const sockets = [...(this.browser.get(tabId)?.sockets ?? [])].map(([id, socket]) => ({ id, url: socket.url, origin: socket.origin, frames: socket.frames }));
+      send(client, { t: 'snapshot', tabId, state, cookies, sockets });
     } catch (err) {
       log.warn('sync subscribe', tabId, errorMessage(err));
       send(client, { t: 'gone', tabId, error: errorMessage(err) });
@@ -148,6 +171,7 @@ export class SyncHub {
   private unsubscribe(client: Client, tabId: string) {
     client.tabs.delete(tabId);
     client.storage.delete(tabId);
+    client.indexedDB.delete(tabId);
     const ts = this.tabs.get(tabId);
     if (!ts) return;
     ts.subscribers.delete(client);
@@ -201,15 +225,15 @@ export class SyncHub {
       if (frame) frame.url = e.url;
     });
     on('Page.frameDetached', (e) => ts.frames.delete(e.frameId));
+    // Which frame shows a dialog: a copy gives the answer only to a frame of the same origin.
+    on('Page.javascriptDialogOpening', (e) => {
+      ts.dialogUrl = e.url ?? '';
+      this.broadcast(ts, { t: 'dialog', tabId: ts.tabId, open: true, type: e.type, message: e.message ?? '', url: ts.dialogUrl }, null);
+    });
 
     // Sending data to a site makes copies refetch once the request is done (and new cookies are in).
     const unsafeAfterAction = (req: Request) =>
       !SAFE_METHODS.has(req.method()) && Date.now() - ts.lastActionAt < 15000 && ['fetch', 'xhr', 'document', 'other'].includes(req.resourceType());
-    const onRequestDone = (req: Request) => {
-      if (!unsafeAfterAction(req)) return;
-      ts.mutated = true;
-      this.schedulePublish(ts);
-    };
     const onNavigated = (frame: Frame) => {
       if (frame !== page.mainFrame()) return;
       ts.nav++;
@@ -217,35 +241,74 @@ export class SyncHub {
       ts.touched.clear();
       this.schedulePublish(ts);
     };
-    // Requests that send data right after an action: their answers go to the copies, which make the
-    // same requests when they replay the action and get these answers instead of sending them again.
+    // Requests that send data right after an action: they are announced to the copies, which make
+    // the same requests when they replay the action, and the answers follow once complete (a copy
+    // keeps waiting while a response streams). Pages the owner got by posting a form go the same way.
+    const announced = new WeakMap<Request, string>();
     const handedOver = (req: Request) =>
       !SAFE_METHODS.has(req.method()) && ['xhr', 'fetch'].includes(req.resourceType()) && Date.now() - ts.lastActionAt < ACTION_WINDOW_MS + 4000;
-    const onResponse = async (res: Response) => {
+    const announce = (req: Request, doc?: string) => {
+      const id = `${++ts.requestSeq}`;
+      announced.set(req, id);
+      const identity = doc ? { key: requestKey('GET', doc), exact: null, loose: '' } : requestIdentity(req.method(), req.url(), req.postDataBuffer());
+      this.broadcast(ts, { t: 'request', tabId: ts.tabId, id, ...identity, ...(doc ? { doc } : {}) }, null);
+    };
+    const onRequest = (req: Request) => {
+      if (ts.subscribers.size > 0 && handedOver(req)) announce(req);
+    };
+    const onResponse = (res: Response) => {
       const req = res.request();
-      if (!handedOver(req) || ts.subscribers.size === 0) return;
-      const body = await res.body().catch(() => Buffer.alloc(0));
+      if (ts.subscribers.size === 0 || SAFE_METHODS.has(req.method()) || !req.isNavigationRequest() || res.status() < 200 || (res.status() >= 300 && res.status() < 400)) return;
+      let main = false;
+      try {
+        main = req.frame() === page.mainFrame();
+      } catch {
+        // not a page's request
+      }
+      if (main) announce(req, req.url());
+    };
+    const failed = (id: string) => this.broadcast(ts, { t: 'response', tabId: ts.tabId, id, status: 0, statusText: '', headers: [], body: '', failed: true }, null);
+    const deliver = async (req: Request, id: string) => {
+      const res = await req.response().catch(() => null);
+      if (!res) return failed(id);
       const headers = (await res.headersArray().catch(() => [])).filter((h) => !HOP_HEADERS.has(h.name.toLowerCase()));
-      const tooBig = body.length > MAX_RESPONSE_BYTES;
-      this.broadcast(
-        ts,
-        { t: 'response', tabId: ts.tabId, key: requestKey(req.method(), req.url()), status: res.status(), statusText: res.statusText(), headers, body: tooBig ? '' : body.toString('base64'), failed: tooBig },
-        null,
-      );
+      // A redirect has no body; the copy follows it like the owner did.
+      if (res.status() >= 300 && res.status() < 400) {
+        return this.broadcast(ts, { t: 'response', tabId: ts.tabId, id, status: res.status(), statusText: res.statusText(), headers, body: '' }, null);
+      }
+      // Oversized answers are not read at all; the copy's request fails instead.
+      const sizes = await req.sizes().catch(() => null);
+      if (Number(res.headers()['content-length'] ?? 0) > MAX_RESPONSE_BYTES || (sizes?.responseBodySize ?? 0) > MAX_RESPONSE_BYTES) return failed(id);
+      const body = await res.body().catch(() => null);
+      if (!body || body.length > MAX_RESPONSE_BYTES) return failed(id);
+      this.broadcast(ts, { t: 'response', tabId: ts.tabId, id, status: res.status(), statusText: res.statusText(), headers, body: body.toString('base64') }, null);
+    };
+    const onRequestFinished = (req: Request) => {
+      if (unsafeAfterAction(req)) {
+        ts.mutated = true;
+        this.schedulePublish(ts);
+      }
+      const id = announced.get(req);
+      if (id) void deliver(req, id).catch(() => failed(id));
     };
     const onRequestFailed = (req: Request) => {
-      onRequestDone(req);
-      if (!handedOver(req) || ts.subscribers.size === 0) return;
-      this.broadcast(ts, { t: 'response', tabId: ts.tabId, key: requestKey(req.method(), req.url()), status: 0, statusText: '', headers: [], body: '', failed: true }, null);
+      if (unsafeAfterAction(req)) {
+        ts.mutated = true;
+        this.schedulePublish(ts);
+      }
+      const id = announced.get(req);
+      if (id) failed(id);
     };
-    page.on('requestfinished', onRequestDone);
-    page.on('requestfailed', onRequestFailed);
+    page.on('request', onRequest);
     page.on('response', onResponse);
+    page.on('requestfinished', onRequestFinished);
+    page.on('requestfailed', onRequestFailed);
     page.on('framenavigated', onNavigated);
     ts.cleanups.push(() => {
-      page.off('requestfinished', onRequestDone);
-      page.off('requestfailed', onRequestFailed);
+      page.off('request', onRequest);
       page.off('response', onResponse);
+      page.off('requestfinished', onRequestFinished);
+      page.off('requestfailed', onRequestFailed);
       page.off('framenavigated', onNavigated);
     });
 
@@ -420,8 +483,11 @@ export class SyncHub {
   }
 
   private remember(ts: TabSync, action: SyncAction) {
-    if (action.kind !== 'input' && action.kind !== 'check' && action.kind !== 'select') return;
-    ts.touched.set(`${action.frame?.url ?? ''}|${action.target.css}`, { frame: action.frame, target: action.target });
+    if (action.kind === 'input' || action.kind === 'check' || action.kind === 'select') this.touch(ts, action.frame, action.target);
+  }
+
+  private touch(ts: TabSync, frame: FrameRef | null, target: SyncField['target']) {
+    ts.touched.set(`${frame?.url ?? ''}|${target.css}`, { frame, target });
     if (ts.touched.size > 60) ts.touched.delete(ts.touched.keys().next().value!);
   }
 
@@ -453,15 +519,20 @@ export class SyncHub {
     const cookies = await this.cookies().catch(() => null);
     const mutated = ts.mutated;
     ts.mutated = false;
+    // IndexedDB is read again after data was sent (a sign-in, say) or when the page changed sites.
+    const origin = originOf(ts.page.url());
+    const stale = mutated || [...ts.subscribers].some((c) => c.indexedDB.get(ts.tabId)?.origin !== origin);
+    const indexedDB = stale ? await this.indexedDb(ts) : undefined;
     for (const client of ts.subscribers) {
-      const state = await this.state(ts, client, false).catch(() => null);
+      const state = await this.state(ts, client, false, indexedDB).catch(() => null);
       if (!state) continue;
       state.mutated = mutated;
       send(client, { t: 'state', tabId: ts.tabId, state, cookies: cookies ? this.cookieDelta(client, cookies) : undefined });
     }
   }
 
-  private async state(ts: TabSync, client: Client, full: boolean): Promise<SyncState> {
+  /** `indexedDB`: just read (null: nothing to copy), or undefined when it was not read this time. */
+  private async state(ts: TabSync, client: Client, full: boolean, indexedDB?: IndexedDbDump | null): Promise<SyncState> {
     const page = ts.page!;
     const tab = this.browser.get(ts.tabId);
     const state: SyncState = { seq: ts.seq, nav: ts.nav, url: page.url(), title: tab?.title ?? '', scroll: { x: 0, y: 0 }, fields: [], mutated: false };
@@ -472,6 +543,14 @@ export class SyncHub {
         () => null,
       );
     state.scroll = (await run<{ x: number; y: number }>(page.mainFrame(), 'scrollPos')) ?? state.scroll;
+    if (full) {
+      // Fields filled before anyone watched (the recorder was not there yet) count as touched too.
+      for (const frame of page.frames()) {
+        const ref: FrameRef | null = frame === page.mainFrame() ? null : { url: frame.url(), name: frame.name() };
+        const filled = await run<Array<Omit<SyncField, 'frame'>>>(frame, 'dirtyFields');
+        for (const field of filled ?? []) this.touch(ts, ref, field.target);
+      }
+    }
     for (const { frame, target } of ts.touched.values()) {
       let f: Frame;
       try {
@@ -490,7 +569,23 @@ export class SyncHub {
         client.storage.set(ts.tabId, json);
       }
     }
+    if (indexedDB !== undefined) {
+      const json = indexedDB ? JSON.stringify(indexedDB) : '';
+      if (indexedDB && (full || client.indexedDB.get(ts.tabId)?.json !== json)) state.indexedDB = indexedDB;
+      client.indexedDB.set(ts.tabId, { origin: originOf(page.url()), json });
+    }
     return state;
+  }
+
+  /** The page's IndexedDB (its own origin), or null when there is none or it cannot be read now. */
+  private async indexedDb(ts: TabSync): Promise<IndexedDbDump | null> {
+    const page = ts.page;
+    if (!page || page.isClosed() || this.browser.get(ts.tabId)?.dialog || !/^https?:/.test(page.url())) return null;
+    const dump = await Promise.race([
+      page.mainFrame().evaluate(`(${IDB_OP})('dump')`) as Promise<IndexedDbDump | null>,
+      new Promise<null>((r) => setTimeout(() => r(null), 5000)),
+    ]).catch(() => null);
+    return dump?.databases.length ? dump : null;
   }
 
   private async cookies(): Promise<SyncCookie[]> {
@@ -516,6 +611,14 @@ export class SyncHub {
     client.cookies = next;
     if (!set.length && !removed.length) return undefined;
     return { set, removed: removed.map(({ name, domain, path }) => ({ name, domain, path })) };
+  }
+}
+
+function originOf(url: string) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return '';
   }
 }
 

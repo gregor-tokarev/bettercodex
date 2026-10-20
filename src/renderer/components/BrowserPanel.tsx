@@ -35,7 +35,9 @@ export function BrowserPanel({ selection }: { selection: Selection }) {
     [allTabs, threadId, draftTabs],
   );
   const current = tabs.find((t) => t.id === selectedId) ?? tabs[tabs.length - 1] ?? null;
-  const synced = !native && remoteTabs !== 'stream' && !(current && !sameMachine && onlyReachableThere(current.url));
+  // A copy that could not load the page (a site only that machine reaches) is streamed as well.
+  const replicaStatus = useReplicaStatus(hostId, current?.id ?? '');
+  const synced = !native && remoteTabs !== 'stream' && !(current && !sameMachine && onlyReachableThere(current.url)) && !replicaStatus?.unreachable;
   const c = conn(hostId);
   const [url, setUrl] = useState('');
   const [editing, setEditing] = useState(false);

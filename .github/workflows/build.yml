@@ -2,10 +2,12 @@ name: Build
 
 # Every push to main or a v* tag produces a release named <latest vX.Y.Z tag>-<first 10 chars of the commit>,
 # e.g. v0.0.1-4b81708844, with an Apple silicon macOS build and x64 Linux builds attached.
+# Pull requests are built the same way but nothing is published.
 on:
   push:
     branches: [main]
     tags: ['v*']
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -75,6 +77,7 @@ jobs:
             release/*.deb
 
   release:
+    if: github.event_name != 'pull_request'
     needs: [version, build]
     runs-on: ubuntu-latest
     steps:
