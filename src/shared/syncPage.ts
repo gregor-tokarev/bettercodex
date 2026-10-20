@@ -95,7 +95,36 @@ export type SyncHostMessage =
   | { t: 'state'; tabId: string; state: SyncState; cookies?: { set: SyncCookie[]; removed: Array<Pick<SyncCookie, 'name' | 'domain' | 'path'>> } }
   | { t: 'action'; tabId: string; seq: number; action: SyncAction }
   | { t: 'ack'; tabId: string; id: string; seq: number; error?: string }
-  | { t: 'gone'; tabId: string; error?: string };
+  | { t: 'gone'; tabId: string; error?: string }
+  | ({ t: 'response'; tabId: string } & SyncResponse);
+
+/**
+ * The owner's answer to a request that sends data (POST and the like) made right after an action.
+ * A copy making the same request then gets this answer instead of sending it again.
+ */
+export interface SyncResponse {
+  key: string;
+  status: number;
+  statusText: string;
+  headers: Array<{ name: string; value: string }>;
+  /** base64 */
+  body: string;
+  /** The owner's request failed (no answer). */
+  failed?: boolean;
+}
+
+/** After an action, requests that send data are answered by the owner for this long. */
+export const ACTION_WINDOW_MS = 8000;
+
+/** Requests are matched by method and address without the query (which often carries timestamps). */
+export function requestKey(method: string, url: string) {
+  try {
+    const u = new URL(url);
+    return `${method.toUpperCase()} ${u.origin}${u.pathname}`;
+  } catch {
+    return `${method.toUpperCase()} ${url}`;
+  }
+}
 
 /** Pages a copy on another computer could not load: that machine's own servers and files. */
 export function onlyReachableThere(url: string) {

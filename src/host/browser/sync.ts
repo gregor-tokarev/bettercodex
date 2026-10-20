@@ -1,7 +1,9 @@
-import type { CDPSession, ElementHandle, Frame, Page, Request } from 'playwright-core';
+import type { CDPSession, ElementHandle, Frame, Page, Request, Response } from 'playwright-core';
 import type { WebSocket } from 'ws';
 import {
+  ACTION_WINDOW_MS,
   installSyncRecorder,
+  requestKey,
   sameDocument,
   syncPageOp,
   type FrameRef,
@@ -23,6 +25,9 @@ const PAGE_OP = syncPageOp.toString();
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 /** What the page does right after a replayed action is that action's doing, not news. */
 const REPLAY_TAIL_MS = 600;
+/** Answers larger than this are not handed to copies (their request then fails there). */
+const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+const HOP_HEADERS = new Set(['content-encoding', 'content-length', 'transfer-encoding', 'connection', 'keep-alive']);
 
 interface Client {
   ws: WebSocket;
@@ -212,12 +217,35 @@ export class SyncHub {
       ts.touched.clear();
       this.schedulePublish(ts);
     };
+    // Requests that send data right after an action: their answers go to the copies, which make the
+    // same requests when they replay the action and get these answers instead of sending them again.
+    const handedOver = (req: Request) =>
+      !SAFE_METHODS.has(req.method()) && ['xhr', 'fetch'].includes(req.resourceType()) && Date.now() - ts.lastActionAt < ACTION_WINDOW_MS + 4000;
+    const onResponse = async (res: Response) => {
+      const req = res.request();
+      if (!handedOver(req) || ts.subscribers.size === 0) return;
+      const body = await res.body().catch(() => Buffer.alloc(0));
+      const headers = (await res.headersArray().catch(() => [])).filter((h) => !HOP_HEADERS.has(h.name.toLowerCase()));
+      const tooBig = body.length > MAX_RESPONSE_BYTES;
+      this.broadcast(
+        ts,
+        { t: 'response', tabId: ts.tabId, key: requestKey(req.method(), req.url()), status: res.status(), statusText: res.statusText(), headers, body: tooBig ? '' : body.toString('base64'), failed: tooBig },
+        null,
+      );
+    };
+    const onRequestFailed = (req: Request) => {
+      onRequestDone(req);
+      if (!handedOver(req) || ts.subscribers.size === 0) return;
+      this.broadcast(ts, { t: 'response', tabId: ts.tabId, key: requestKey(req.method(), req.url()), status: 0, statusText: '', headers: [], body: '', failed: true }, null);
+    };
     page.on('requestfinished', onRequestDone);
-    page.on('requestfailed', onRequestDone);
+    page.on('requestfailed', onRequestFailed);
+    page.on('response', onResponse);
     page.on('framenavigated', onNavigated);
     ts.cleanups.push(() => {
       page.off('requestfinished', onRequestDone);
-      page.off('requestfailed', onRequestDone);
+      page.off('requestfailed', onRequestFailed);
+      page.off('response', onResponse);
       page.off('framenavigated', onNavigated);
     });
 
@@ -329,15 +357,26 @@ export class SyncHub {
     const page = ts.page;
     if (!page || page.isClosed()) throw new Error('The tab is not open');
     if (this.browser.get(ts.tabId)?.dialog) throw new Error('A dialog is open in this tab');
-    const frame = this.frameFor(page, action.frame);
-    // An action meant for one page must not land on whatever page is open by now.
+    // The copy may be ahead (this page is still loading): give it a moment to reach the same page.
+    // An action meant for one page must never land on whatever other page is open by then.
+    let frame = this.frameFor(page, action.frame);
+    for (const until = Date.now() + 8000; action.doc && !sameDocument(frame.url(), action.doc) && Date.now() < until; ) {
+      await new Promise((r) => setTimeout(r, 200));
+      frame = this.frameFor(page, action.frame);
+    }
     if (action.doc && !sameDocument(frame.url(), action.doc)) throw new Error('The page changed before this action arrived');
     const handles: ElementHandle[] = [];
     const element = async () => {
-      const handle = (await frame.evaluateHandle(`(${PAGE_OP})('element', ${JSON.stringify(action.target)})`)).asElement() as ElementHandle<Element> | null;
-      if (!handle) throw new Error(`Element ${action.target?.label || action.target?.css} is not on this page`);
-      handles.push(handle);
-      return handle;
+      // A page that just loaded may not have built the element yet.
+      for (const until = Date.now() + 5000; ; ) {
+        const handle = (await frame.evaluateHandle(`(${PAGE_OP})('element', ${JSON.stringify(action.target)})`)).asElement() as ElementHandle<Element> | null;
+        if (handle) {
+          handles.push(handle);
+          return handle;
+        }
+        if (Date.now() > until) throw new Error(`Element ${action.target?.label || action.target?.css} is not on this page`);
+        await new Promise((r) => setTimeout(r, 250));
+      }
     };
     try {
       switch (action.kind) {

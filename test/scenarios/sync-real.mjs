@@ -35,6 +35,21 @@ export default async function ({ win, app, shot, sleep, out }) {
   await win.click('.host-popover .popover-item:has-text("remote-sim")');
   await win.waitForSelector('.hero', { timeout: 30000 });
   if (!(await win.$('.browser-panel'))) await win.click('button[title="Toggle browser"]');
+
+  // A sign-in page that loads its settings through POST requests (it used to fail in copies).
+  await win.click('.url-form input');
+  await win.fill('.url-form input', 'https://e.mail.ru/');
+  await win.keyboard.press('Enter');
+  let mail;
+  await until('the mail sign-in copy', async () => {
+    mail = app.windows().find((p) => /id\.vk\.ru|e\.mail\.ru|account\.mail\.ru/.test(p.url()) && p !== win);
+    return !!mail && /Sign in|Войти/.test(await mail.evaluate(() => document.body.innerText));
+  }, 30000);
+  const errorShown = await mail.evaluate(() => /Check your internet connection|Проверьте подключение/.test(document.body.innerText));
+  console.log('mail sign-in in the copy:', mail.url().slice(0, 60), '| error shown:', errorShown);
+  rootShot(out, '89-mail-sign-in');
+  if (errorShown) throw new Error('the sign-in page shows a connection error in the copy');
+
   for (const [name, url, link] of [
     ['wikipedia', 'https://en.wikipedia.org/wiki/Electron_(software_framework)', { role: 'link', name: 'Chromium browser engine' }],
     ['github', 'https://github.com/electron/electron', { role: 'link', name: /^Issues/ }],
