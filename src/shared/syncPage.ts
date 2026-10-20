@@ -80,7 +80,35 @@ export interface SyncState {
   mutated: boolean;
   /** localStorage of the top document's origin, when it changed. */
   storage?: { origin: string; items: Record<string, string> };
+  /** IndexedDB of the top document's origin (sign-ins often live there), when it changed. */
+  indexedDB?: IndexedDbDump;
 }
+
+export interface IndexedDbDump {
+  origin: string;
+  databases: Array<{
+    name: string;
+    version: number;
+    stores: Array<{
+      name: string;
+      keyPath: string | string[] | null;
+      autoIncrement: boolean;
+      indexes: Array<{ name: string; keyPath: string | string[]; unique: boolean; multiEntry: boolean }>;
+      /** [key, value], both encoded by indexedDbOp. */
+      rows: Array<[unknown, unknown]>;
+    }>;
+  }>;
+}
+
+/** A frame a WebSocket of the owner's page received (binary ones in base64). */
+export interface SocketFrame {
+  data: string;
+  binary?: boolean;
+}
+
+/** The first frames of each WebSocket (a handshake, usually) are kept for copies connecting later. */
+export const SOCKET_HANDSHAKE_FRAMES = 20;
+export const SOCKET_HANDSHAKE_BYTES = 256 * 1024;
 
 // ---- /sync websocket: JSON text frames ----
 
@@ -91,19 +119,48 @@ export type SyncClientMessage =
   | { t: 'navigate'; tabId: string; action: 'back' | 'forward' | 'reload' };
 
 export type SyncHostMessage =
-  | { t: 'snapshot'; tabId: string; state: SyncState; cookies: SyncCookie[] }
+  | {
+      t: 'snapshot';
+      tabId: string;
+      state: SyncState;
+      cookies: SyncCookie[];
+      /** The page's open WebSockets, with the first frames each received (their handshake). */
+      sockets: Array<{ id: string; url: string; frames: SocketFrame[] }>;
+    }
   | { t: 'state'; tabId: string; state: SyncState; cookies?: { set: SyncCookie[]; removed: Array<Pick<SyncCookie, 'name' | 'domain' | 'path'>> } }
   | { t: 'action'; tabId: string; seq: number; action: SyncAction }
   | { t: 'ack'; tabId: string; id: string; seq: number; error?: string }
   | { t: 'gone'; tabId: string; error?: string }
-  | ({ t: 'response'; tabId: string } & SyncResponse);
+  | ({ t: 'request'; tabId: string } & SyncRequest)
+  | ({ t: 'response'; tabId: string } & SyncResponse)
+  /** A dialog opened on the owner, or was answered there (with the answer). */
+  | { t: 'dialog'; tabId: string; open: boolean; type: string; message: string; accept?: boolean; value?: string | null }
+  /** The owner's page WebSockets: copies never connect themselves, they get what the owner receives. */
+  | ({ t: 'socket'; tabId: string; id: string } & ({ event: 'open'; url: string } | ({ event: 'message' } & SocketFrame) | { event: 'close' }));
 
 /**
- * The owner's answer to a request that sends data (POST and the like) made right after an action.
- * A copy making the same request then gets this answer instead of sending it again.
+ * A request of the owner's page whose answer goes to the copies: one that sends data right after an
+ * action (`doc` unset), or a page the owner got by posting a form (`doc` is its URL). Copies make
+ * the same request when they replay the action, and get the owner's answer instead of sending it.
  */
-export interface SyncResponse {
+export interface SyncRequest extends RequestIdentity {
+  id: string;
+  doc?: string;
+}
+
+/** Identifies a request across machines, from exact (same address and data) to loose. */
+export interface RequestIdentity {
+  /** Method and address without the query. */
   key: string;
+  /** Method, full address and data; null when the data is not known. */
+  exact: string | null;
+  /** Like exact, with numbers and long tokens (timestamps, ids, nonces) left out. */
+  loose: string;
+}
+
+/** The owner's answer to a SyncRequest (same id), sent once the whole response is in. */
+export interface SyncResponse {
+  id: string;
   status: number;
   statusText: string;
   headers: Array<{ name: string; value: string }>;
@@ -116,7 +173,7 @@ export interface SyncResponse {
 /** After an action, requests that send data are answered by the owner for this long. */
 export const ACTION_WINDOW_MS = 8000;
 
-/** Requests are matched by method and address without the query (which often carries timestamps). */
+/** Method and address without the query (which often carries timestamps). */
 export function requestKey(method: string, url: string) {
   try {
     const u = new URL(url);
@@ -124,6 +181,32 @@ export function requestKey(method: string, url: string) {
   } catch {
     return `${method.toUpperCase()} ${url}`;
   }
+}
+
+export function requestIdentity(method: string, url: string, body: Uint8Array | null): RequestIdentity {
+  const key = requestKey(method, url);
+  const query = url.split('#')[0].split('?')[1] ?? '';
+  const text = body ? new TextDecoder().decode(body.subarray(0, 256 * 1024)) : '';
+  const vague = (s: string) => s.replace(/[0-9a-f]{8,}(?:-[0-9a-f]{4,})*|[\w-]{24,}|\d+(?:\.\d+)?/gi, '#');
+  return {
+    key,
+    exact: body ? hash(`${method.toUpperCase()} ${url.split('#')[0]}\n${hash(body)}`) : null,
+    loose: hash(`${key}?${vague(query)}\n${vague(text)}`),
+  };
+}
+
+/** A fast 53-bit hash (cyrb53); matching requests needs no cryptography. */
+function hash(data: string | Uint8Array) {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < data.length; i++) {
+    const ch = typeof data === 'string' ? data.charCodeAt(i) : data[i];
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
 }
 
 /** Pages a copy on another computer could not load: that machine's own servers and files. */
@@ -260,6 +343,7 @@ export function installSyncRecorder(emit: (json: string) => void, replica: boole
   // the person did something: a key, a pointer, pasting, dropping or an input method.
   let lastUserInput = 0;
   let lastGesture = 0;
+  let gestureTarget: EventTarget | null = null;
   for (const type of ['pointerdown', 'wheel', 'keydown', 'touchmove']) {
     addEventListener(
       type,
@@ -273,11 +357,17 @@ export function installSyncRecorder(emit: (json: string) => void, replica: boole
     addEventListener(
       type,
       (e) => {
-        if (e.isTrusted) lastGesture = Date.now();
+        if (!e.isTrusted) return;
+        lastGesture = Date.now();
+        gestureTarget = e.target;
       },
       { capture: true, passive: true },
     );
   }
+  // Selects, colors and dates are chosen in a popup of their own (no page events): the choice may
+  // come long after the click that opened it.
+  const PICKERS = ['color', 'date', 'time', 'datetime-local', 'month', 'week'];
+  const picker = (el: EventTarget | null) => el instanceof HTMLSelectElement || (el instanceof HTMLInputElement && PICKERS.includes(el.type));
 
   addEventListener(
     'click',
@@ -303,14 +393,15 @@ export function installSyncRecorder(emit: (json: string) => void, replica: boole
     true,
   );
 
-  const counts = (e: Event) => (replica ? e.isTrusted && Date.now() - lastGesture < 1500 : true);
+  const counts = (e: Event) =>
+    replica ? e.isTrusted && (Date.now() - lastGesture < 1500 || (picker(e.target) && e.target === gestureTarget && Date.now() - lastGesture < 300000)) : true;
   addEventListener(
     'input',
     (e) => {
       if (!counts(e) || !(e.target instanceof Element)) return;
       let el: Element = e.target;
       if ((el as HTMLElement).isContentEditable) el = editableRoot(el);
-      else if (!isTextField(el) && !(el instanceof HTMLInputElement && el.type === 'range')) return;
+      else if (!isTextField(el) && !(el instanceof HTMLInputElement && (el.type === 'range' || el.type === 'color'))) return;
       const timer = pending.get(el);
       if (timer !== undefined) clearTimeout(timer);
       pending.set(
@@ -456,6 +547,56 @@ export function syncPageOp(op: string, ref: ElementRef | null, arg?: any): any {
     return ok(byPath) ? byPath : null;
   };
 
+  if (op === 'dirtyFields') {
+    // Fields filled before anyone watched (the recorder was not there yet). Values a framework keeps
+    // in sync with the value attribute look untouched, so every filled text field counts.
+    const cssPath = (el: Element) => {
+      const parts: string[] = [];
+      for (let node: Element | null = el; node && node !== document.documentElement; node = node.parentElement) {
+        if (node.id && /^[A-Za-z][\w-]*$/.test(node.id) && !/\d{4,}/.test(node.id) && document.querySelectorAll(`#${CSS.escape(node.id)}`).length === 1) {
+          parts.unshift(`#${CSS.escape(node.id)}`);
+          break;
+        }
+        const tag = node.tagName.toLowerCase();
+        const parent: Element | null = node.parentElement;
+        if (!parent) {
+          parts.unshift(tag);
+          break;
+        }
+        const same = Array.from(parent.children).filter((c) => c.tagName === node!.tagName);
+        parts.unshift(same.length > 1 ? `${tag}:nth-of-type(${same.indexOf(node) + 1})` : tag);
+      }
+      return parts.join(' > ');
+    };
+    const describe = (el: Element) => {
+      const ref: Record<string, string> = { tag: el.tagName.toLowerCase(), css: cssPath(el) };
+      if (el.id && !/\d{4,}|[0-9a-f]{8,}|:/i.test(el.id)) ref.id = el.id;
+      const testId = el.getAttribute('data-testid') ?? el.getAttribute('data-test') ?? el.getAttribute('data-qa') ?? el.getAttribute('data-test-id');
+      if (testId) ref.testId = testId;
+      const nameAttr = el.getAttribute('name');
+      if (nameAttr) ref.nameAttr = nameAttr;
+      const role = el.getAttribute('role');
+      if (role) ref.role = role;
+      const text = label(el);
+      if (text) ref.label = text;
+      return ref;
+    };
+    const fields: Array<{ target: Record<string, string>; value?: string; checked?: boolean; values?: string[] }> = [];
+    for (const el of Array.from(document.querySelectorAll('input, textarea, select'))) {
+      if (fields.length >= 60) break;
+      if (el instanceof HTMLInputElement) {
+        if (['button', 'submit', 'reset', 'image', 'file', 'hidden'].includes(el.type)) continue;
+        if (el.type === 'checkbox' || el.type === 'radio') {
+          if (el.checked !== el.defaultChecked) fields.push({ target: describe(el), checked: el.checked });
+        } else if (el.value !== el.defaultValue || (el.value && el.type !== 'range' && el.type !== 'color')) fields.push({ target: describe(el), value: el.value });
+      } else if (el instanceof HTMLTextAreaElement) {
+        if (el.value) fields.push({ target: describe(el), value: el.value });
+      } else if (el instanceof HTMLSelectElement && Array.from(el.options).some((o) => o.selected !== o.defaultSelected)) {
+        fields.push({ target: describe(el), values: Array.from(el.selectedOptions).map((o) => o.value) });
+      }
+    }
+    return fields;
+  }
   if (op === 'scrollPos') return { x: Math.round(scrollX), y: Math.round(scrollY) };
   if (op === 'storage') {
     try {
@@ -553,4 +694,224 @@ export function syncPageOp(op: string, ref: ElementRef | null, arg?: any): any {
     }
   }
   return null;
+}
+
+/** Page address a copy loads (answered locally) to write an origin's IndexedDB before its pages run. */
+export const SEED_PATH = '/__bettercodex_seed__';
+
+/**
+ * Reads ('dump') or replaces ('restore') the IndexedDB databases of the page's origin. Runs inside
+ * pages like the functions above. Values travel as JSON with their types tagged; records that
+ * cannot be copied (Web Crypto keys, for one) are left out, and so are large databases.
+ */
+export async function indexedDbOp(op: 'dump' | 'restore', arg?: any): Promise<any> {
+  const LIMIT = 2 * 1024 * 1024;
+  const b64 = (buf: ArrayBuffer) => {
+    const bytes = new Uint8Array(buf);
+    let s = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    return btoa(s);
+  };
+  const unb64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+  if (op === 'dump') {
+    if (!/^https?:$/.test(location.protocol) || !indexedDB.databases) return null;
+    const rough = (v: any) => {
+      try {
+        if (v instanceof Blob) return v.size;
+        if (v instanceof ArrayBuffer || ArrayBuffer.isView(v)) return v.byteLength;
+        return JSON.stringify(v)?.length ?? 8;
+      } catch {
+        return 1024;
+      }
+    };
+    const encode = async (v: any): Promise<any> => {
+      if (v === null || typeof v === 'string' || typeof v === 'boolean') return v;
+      if (typeof v === 'number') return Number.isFinite(v) ? v : { $: 'num', v: String(v) };
+      if (v === undefined) return { $: 'undef' };
+      if (typeof v === 'bigint') return { $: 'big', v: v.toString() };
+      if (Array.isArray(v)) return { $: 'arr', v: await Promise.all(v.map(encode)) };
+      if (v instanceof Date) return { $: 'date', v: v.getTime() };
+      if (v instanceof ArrayBuffer) return { $: 'buf', v: b64(v) };
+      if (ArrayBuffer.isView(v)) return { $: 'view', t: v.constructor.name, v: b64(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength) as ArrayBuffer) };
+      if (v instanceof Blob) return { $: 'blob', type: v.type, name: v instanceof File ? v.name : undefined, v: b64(await v.arrayBuffer()) };
+      if (v instanceof Map) return { $: 'map', v: await Promise.all([...v].map(async ([k, x]) => [await encode(k), await encode(x)])) };
+      if (v instanceof Set) return { $: 'set', v: await Promise.all([...v].map(encode)) };
+      if (v instanceof RegExp) return { $: 're', v: v.source, f: v.flags };
+      const proto = Object.getPrototypeOf(v);
+      if (proto !== Object.prototype && proto !== null) throw new Error('not copyable');
+      const out: Record<string, unknown> = {};
+      for (const [k, x] of Object.entries(v)) out[k] = await encode(x);
+      return { $: 'obj', v: out };
+    };
+    const open = (name: string) =>
+      new Promise<IDBDatabase | null>((resolve) => {
+        const r = indexedDB.open(name);
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = r.onblocked = () => resolve(null);
+        // It does not exist (any more): do not create it.
+        r.onupgradeneeded = () => r.transaction?.abort();
+      });
+    // Reads a store within the transaction (no other awaits there), giving up past the size limit.
+    const read = (store: IDBObjectStore) =>
+      new Promise<Array<[any, any]> | null>((resolve, reject) => {
+        const rows: Array<[any, any]> = [];
+        let size = 0;
+        const r = store.openCursor();
+        r.onerror = () => reject(r.error);
+        r.onsuccess = () => {
+          const cursor = r.result;
+          if (!cursor) return resolve(rows);
+          size += rough(cursor.value);
+          if (size > LIMIT) return resolve(null);
+          rows.push([cursor.primaryKey, cursor.value]);
+          cursor.continue();
+        };
+      });
+    const databases: any[] = [];
+    let total = 0;
+    for (const info of await indexedDB.databases()) {
+      if (!info.name) continue;
+      const db = await open(info.name);
+      if (!db) continue;
+      db.onversionchange = () => db.close();
+      try {
+        const names = Array.from(db.objectStoreNames);
+        const raw: Array<{ store: IDBObjectStore; rows: Array<[any, any]> }> = [];
+        if (names.length) {
+          const tx = db.transaction(names, 'readonly');
+          let tooBig = false;
+          for (const name of names) {
+            const store = tx.objectStore(name);
+            const rows = await read(store);
+            if (!rows) {
+              tooBig = true;
+              break;
+            }
+            raw.push({ store, rows });
+          }
+          if (tooBig) continue;
+        }
+        const stores = [];
+        for (const { store, rows } of raw) {
+          const encoded: Array<[unknown, unknown]> = [];
+          for (const [k, v] of rows) {
+            try {
+              encoded.push([await encode(k), await encode(v)]);
+            } catch {
+              // not copyable: left out
+            }
+          }
+          stores.push({
+            name: store.name,
+            keyPath: store.keyPath,
+            autoIncrement: store.autoIncrement,
+            indexes: Array.from(store.indexNames).map((n) => {
+              const index = store.index(n);
+              return { name: index.name, keyPath: index.keyPath, unique: index.unique, multiEntry: index.multiEntry };
+            }),
+            rows: encoded,
+          });
+        }
+        const dump = { name: db.name, version: db.version, stores };
+        const size = JSON.stringify(dump).length;
+        if (size > LIMIT || total + size > 2 * LIMIT) continue;
+        total += size;
+        databases.push(dump);
+      } catch {
+        // unreadable: left out
+      } finally {
+        db.close();
+      }
+    }
+    return { origin: location.origin, databases };
+  }
+
+  // restore: replaces each database of the dump (others stay as they are)
+  const decode = (v: any): any => {
+    if (v === null || typeof v !== 'object') return v;
+    switch (v.$) {
+      case 'num':
+        return Number(v.v);
+      case 'undef':
+        return undefined;
+      case 'big':
+        return BigInt(v.v);
+      case 'arr':
+        return v.v.map(decode);
+      case 'date':
+        return new Date(v.v);
+      case 'buf':
+        return unb64(v.v).buffer;
+      case 'view': {
+        const bytes = unb64(v.v);
+        const Ctor = (globalThis as any)[v.t];
+        return v.t === 'DataView' ? new DataView(bytes.buffer) : typeof Ctor === 'function' ? new Ctor(bytes.buffer) : bytes;
+      }
+      case 'blob':
+        return v.name !== undefined ? new File([unb64(v.v)], v.name, { type: v.type }) : new Blob([unb64(v.v)], { type: v.type });
+      case 'map':
+        return new Map(v.v.map(([k, x]: [unknown, unknown]) => [decode(k), decode(x)]));
+      case 'set':
+        return new Set(v.v.map(decode));
+      case 're':
+        return new RegExp(v.v, v.f);
+      case 'obj': {
+        const out: Record<string, unknown> = {};
+        for (const [k, x] of Object.entries(v.v)) out[k] = decode(x);
+        return out;
+      }
+    }
+    return v;
+  };
+  const settle = <T>(start: (resolve: (value: T) => void) => void, fallback: T) =>
+    new Promise<T>((resolve) => {
+      const timer = setTimeout(() => resolve(fallback), 3000);
+      start((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      });
+    });
+  for (const d of (arg?.databases ?? []) as IndexedDbDump['databases']) {
+    // Other copies of this origin close their connections when asked to (or the wait runs out).
+    await settle<void>((done) => {
+      const r = indexedDB.deleteDatabase(d.name);
+      r.onsuccess = r.onerror = () => done();
+    }, undefined);
+    const db = await settle<IDBDatabase | null>((done) => {
+      const r = indexedDB.open(d.name, d.version);
+      r.onupgradeneeded = () => {
+        for (const s of d.stores) {
+          if (r.result.objectStoreNames.contains(s.name)) continue;
+          const store = r.result.createObjectStore(s.name, { keyPath: s.keyPath ?? undefined, autoIncrement: s.autoIncrement });
+          for (const ix of s.indexes) store.createIndex(ix.name, ix.keyPath, { unique: ix.unique, multiEntry: ix.multiEntry });
+        }
+      };
+      r.onsuccess = () => done(r.result);
+      r.onerror = () => done(null);
+    }, null);
+    if (!db) continue;
+    const names = d.stores.map((s) => s.name).filter((n) => db.objectStoreNames.contains(n));
+    if (names.length) {
+      await settle<void>((done) => {
+        const tx = db.transaction(names, 'readwrite');
+        tx.oncomplete = tx.onerror = tx.onabort = () => done();
+        for (const s of d.stores) {
+          if (!names.includes(s.name)) continue;
+          const store = tx.objectStore(s.name);
+          for (const [k, v] of s.rows) {
+            try {
+              const put = s.keyPath != null ? store.put(decode(v)) : store.put(decode(v), decode(k));
+              // One record that does not fit must not undo the others.
+              put.onerror = (e) => e.preventDefault();
+            } catch {
+              // left out
+            }
+          }
+        }
+      }, undefined);
+    }
+    db.close();
+  }
+  return true;
 }

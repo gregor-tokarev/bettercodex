@@ -569,7 +569,7 @@ class Bridge {
     for (const [sessionId, id] of this.pageSessions) {
       if (id === d.tab.targetId) this.send({ method: 'Page.javascriptDialogClosed', params: { result: accept, userInput: promptText ?? '' }, sessionId });
     }
-    this.event('BetterCodex.dialogClosed', { targetId: d.tab.targetId });
+    this.event('BetterCodex.dialogClosed', { targetId: d.tab.targetId, accept, promptText });
   }
 
   private send(msg: Json | string) {

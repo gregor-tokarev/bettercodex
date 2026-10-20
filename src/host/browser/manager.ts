@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { chromium, type Browser, type BrowserContext, type CDPSession, type Dialog, type Download, type FileChooser, type Page } from 'playwright-core';
+import { SOCKET_HANDSHAKE_BYTES, SOCKET_HANDSHAKE_FRAMES, type SocketFrame } from '../../shared/syncPage.js';
 import type { AppBrowserRegistration, BrowserStatus, DownloadInfo, HostConfig, TabDialog, TabInfo } from '../../shared/types.js';
 import { isPidAlive, paths, readJson, writeJson } from '../config.js';
 import { errorMessage, log } from '../log.js';
@@ -34,6 +35,8 @@ interface TabRecord {
   agentCalls: number;
   console: ConsoleEntry[];
   fileChooser: FileChooser | null;
+  /** Open WebSockets of the page, with their first frames (synced copies get what they receive). */
+  sockets: Map<string, { url: string; frames: SocketFrame[]; bytes: number }>;
 }
 
 interface PersistedTabs {
@@ -57,6 +60,7 @@ export class BrowserManager extends EventEmitter {
   status: BrowserStatus = { state: 'idle', engine: null, appInstanceId: null, executablePath: null, mode: null, version: null, error: null, profileDir: paths.profile };
   /** Which browser the live context belongs to. */
   engine: 'app' | 'chromium' | null = null;
+  private socketSeq = 0;
   readonly downloads: DownloadInfo[] = [];
 
   private tabs = new Map<string, TabRecord>();
@@ -94,7 +98,7 @@ export class BrowserManager extends EventEmitter {
     this.nextId = stored.nextId;
     this.current = stored.current ?? {};
     for (const t of stored.tabs) {
-      this.tabs.set(t.id, { ...t, targetId: t.targetId ?? null, page: null, loading: false, dialog: null, agentCalls: 0, console: [], fileChooser: null });
+      this.tabs.set(t.id, { ...t, targetId: t.targetId ?? null, page: null, loading: false, dialog: null, agentCalls: 0, console: [], fileChooser: null, sockets: new Map() });
     }
   }
 
@@ -202,7 +206,7 @@ export class BrowserManager extends EventEmitter {
       const send = control.send.bind(control) as (method: string, params?: object) => Promise<any>;
       const on = control.on.bind(control) as (event: string, fn: (e: any) => void) => void;
       // Dialogs arrive as regular Playwright dialogs; this only says when one was answered in the app.
-      on('BetterCodex.dialogClosed', (e: { targetId: string | null }) => this.onAppDialogClosed(e.targetId));
+      on('BetterCodex.dialogClosed', (e: { targetId: string | null; accept?: boolean; promptText?: string }) => this.onAppDialogClosed(e.targetId, !!e.accept, e.promptText));
       await send('BetterCodex.enable', { downloadsDir: paths.downloads });
       this.appConnection = browser;
       this.control = control;
@@ -331,6 +335,7 @@ export class BrowserManager extends EventEmitter {
       tab.page = null;
       tab.dialog = null;
       tab.loading = false;
+      tab.sockets.clear();
     }
     this.setStatus({ state: 'idle' });
     this.changed();
@@ -540,7 +545,9 @@ export class BrowserManager extends EventEmitter {
     if (!tab || !dialog) throw new Error('No dialog is open in this tab');
     tab.dialog = null;
     this.changed();
-    if (accept) await dialog.accept(promptText ?? dialog.defaultValue());
+    const value = accept ? (promptText ?? dialog.defaultValue()) : null;
+    this.emit('dialogClosed', { tabId, type: dialog.type(), message: dialog.message(), accept, promptText: value });
+    if (accept) await dialog.accept(value!);
     else await dialog.dismiss();
   }
 
@@ -608,6 +615,7 @@ export class BrowserManager extends EventEmitter {
       agentCalls: 0,
       console: [],
       fileChooser: null,
+      sockets: new Map(),
     };
     this.tabs.set(id, tab);
     this.attachPage(tab, page);
@@ -659,6 +667,7 @@ export class BrowserManager extends EventEmitter {
       if (tab.page !== page) return;
       tab.page = null;
       tab.dialog = null;
+      tab.sockets.clear();
       this.changed();
       // A page closed by the site or the user removes its tab; the whole browser going away
       // (shutdown, restart, crash) keeps the tab so it can be restored later.
@@ -682,6 +691,26 @@ export class BrowserManager extends EventEmitter {
       tab.dialog = dialog;
       this.changed();
       this.emit('dialog', { tabId: tab.id, threadId: tab.threadId, dialog: dialogInfo(dialog) });
+    });
+    page.on('websocket', (ws) => {
+      const id = `${++this.socketSeq}`;
+      const socket = { url: ws.url(), frames: [] as SocketFrame[], bytes: 0 };
+      tab.sockets.set(id, socket);
+      this.emit('socket', { tabId: tab.id, id, event: 'open', url: socket.url });
+      ws.on('framereceived', ({ payload }) => {
+        if (!tab.sockets.has(id)) return;
+        const frame: SocketFrame = typeof payload === 'string' ? { data: payload } : { data: payload.toString('base64'), binary: true };
+        if (socket.frames.length < SOCKET_HANDSHAKE_FRAMES && socket.bytes + frame.data.length <= SOCKET_HANDSHAKE_BYTES) {
+          socket.frames.push(frame);
+          socket.bytes += frame.data.length;
+        }
+        this.emit('socket', { tabId: tab.id, id, event: 'message', ...frame });
+      });
+      const closed = () => {
+        if (tab.sockets.delete(id)) this.emit('socket', { tabId: tab.id, id, event: 'close' });
+      };
+      ws.on('close', closed);
+      ws.on('socketerror', closed);
     });
     // A streamed tab needs the watching client to pick files; the app shows its own picker otherwise.
     this.syncFileChooser(tab);
@@ -721,11 +750,14 @@ export class BrowserManager extends EventEmitter {
     else this.adoptPage(page, { threadId: null, createdBy: 'page' });
   }
 
-  private onAppDialogClosed(targetId: string | null) {
+  private onAppDialogClosed(targetId: string | null, accept: boolean, promptText?: string) {
     for (const tab of this.tabs.values()) {
       if (tab.dialog && tab.targetId === targetId) {
+        const dialog = tab.dialog;
         tab.dialog = null;
         this.changed();
+        const value = accept ? (promptText ?? dialog.defaultValue()) : null;
+        this.emit('dialogClosed', { tabId: tab.id, type: dialog.type(), message: dialog.message(), accept, promptText: value });
       }
     }
   }
