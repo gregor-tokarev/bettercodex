@@ -7,6 +7,7 @@ import { Composer } from './Composer';
 import { IconCheck, IconChevronDown, IconChevronRight, IconFolder, IconGlobe, Spinner } from './Icons';
 import { ItemView } from './Items';
 import { ProjectPicker } from './ProjectPicker';
+import { ThreadSchedules } from './Scheduled';
 import { threadTitle } from './Sidebar';
 
 function formatDuration(ms: number) {
@@ -152,6 +153,7 @@ export function ThreadView({ hostId, threadId }: { hostId: string; threadId: str
         )}
       </div>
       <Composer hostId={hostId} threadId={threadId}>
+        {threadId && <ThreadSchedules hostId={hostId} threadId={threadId} />}
         {tv?.plan && tv.activeTurnId && (
           <div className="plan-card">
             {tv.plan.explanation && <div className="plan-explanation">{tv.plan.explanation}</div>}

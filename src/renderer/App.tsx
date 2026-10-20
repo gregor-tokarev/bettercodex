@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { BrowserPanel } from './components/BrowserPanel';
+import { ScheduledView, TaskEditor } from './components/Scheduled';
 import { Settings } from './components/Settings';
 import { Sidebar } from './components/Sidebar';
 import { ThreadView } from './components/ThreadView';
@@ -8,6 +9,7 @@ import { bc, isMac } from './lib/bridge';
 
 export function App() {
   const selection = useStore((s) => s.selection);
+  const view = useStore((s) => s.view);
   const browserOpen = useStore((s) => s.prefs.browserOpen);
   const toastMsg = useStore((s) => s.toast);
   const theme = useStore((s) => s.prefs.theme);
@@ -48,10 +50,17 @@ export function App() {
     <div className="app">
       <Sidebar />
       <main className="main">
-        {selection ? <ThreadView key={`${selection.hostId}:${selection.threadId ?? 'draft'}`} hostId={selection.hostId} threadId={selection.threadId} /> : <div className="center-note">Starting…</div>}
+        {view === 'scheduled' ? (
+          <ScheduledView />
+        ) : selection ? (
+          <ThreadView key={`${selection.hostId}:${selection.threadId ?? 'draft'}`} hostId={selection.hostId} threadId={selection.threadId} />
+        ) : (
+          <div className="center-note">Starting…</div>
+        )}
       </main>
-      {selection && browserOpen && <BrowserPanel selection={selection} />}
+      {selection && browserOpen && view === 'thread' && <BrowserPanel selection={selection} />}
       <Settings />
+      <TaskEditor />
       {toastMsg && <div className="toast" onClick={() => setState({ toast: null })}>{toastMsg}</div>}
     </div>
   );

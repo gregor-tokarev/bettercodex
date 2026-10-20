@@ -1,5 +1,18 @@
 import { useRef, useSyncExternalStore } from 'react';
-import type { DownloadInfo, HostInfo, HostMessage, TabInfo, UpdateStatus } from '../../shared/types';
+import type { ScheduleInput } from '../../shared/schedule';
+import type {
+  DownloadInfo,
+  HostInfo,
+  HostMessage,
+  RelayMachine,
+  RelayRequest,
+  ScheduledRun,
+  ScheduledTask,
+  ScheduleSnapshot,
+  TabInfo,
+  TaskAccess,
+  UpdateStatus,
+} from '../../shared/types';
 import type { Model } from '../../shared/codex-protocol/v2/Model';
 import type { Thread } from '../../shared/codex-protocol/v2/Thread';
 import type { ThreadItem } from '../../shared/codex-protocol/v2/ThreadItem';
@@ -8,7 +21,7 @@ import type { ThreadTokenUsage } from '../../shared/codex-protocol/v2/ThreadToke
 import type { TurnPlanStep } from '../../shared/codex-protocol/v2/TurnPlanStep';
 import type { UserInput } from '../../shared/codex-protocol/v2/UserInput';
 import { bc, type HostListEntry, type HostStatus } from './bridge';
-import { HostConnection } from './connection';
+import { HostConnection, type RpcFailure } from './connection';
 
 export type AccessMode = 'read-only' | 'auto' | 'full';
 
@@ -37,6 +50,10 @@ export interface HostView {
   tabs: TabInfo[];
   requests: ServerReq[];
   downloads: DownloadInfo[];
+  /** Scheduled tasks and recent runs on this machine. */
+  schedule: ScheduleSnapshot | null;
+  /** This computer's clock minus the machine's, for "in 5 min" labels. */
+  clockSkew: number;
 }
 
 export interface TurnView {
@@ -86,10 +103,23 @@ export interface Selection {
   threadId: string | null;
 }
 
+/** What the task editor opens with: an existing task, or a new one with some fields filled in. */
+export interface TaskDraft {
+  hostId: string;
+  taskId: string | null;
+  prompt?: string;
+  threadId?: string | null;
+  /** Called once the editor has saved the task. */
+  onSaved?: () => void;
+}
+
 export interface AppState {
   hosts: Record<string, HostView>;
   hostOrder: string[];
   selection: Selection | null;
+  /** The main area shows the selected thread or the scheduled tasks of all machines. */
+  view: 'thread' | 'scheduled';
+  taskDraft: TaskDraft | null;
   threads: Record<string, ThreadView>;
   /** Per-thread composer overrides (model/effort/access). */
   threadSettings: Record<string, { model?: string | null; effort?: string | null; access?: AccessMode }>;
@@ -135,6 +165,8 @@ let state: AppState = {
   hosts: {},
   hostOrder: [],
   selection: null,
+  view: 'thread',
+  taskDraft: null,
   threads: {},
   threadSettings: {},
   browserTab: {},
@@ -258,6 +290,8 @@ function hostViewFrom(entry: HostListEntry, prev?: HostView): HostView {
     tabs: prev?.tabs ?? [],
     requests: prev?.requests ?? [],
     downloads: prev?.downloads ?? [],
+    schedule: prev?.schedule ?? null,
+    clockSkew: prev?.clockSkew ?? 0,
   };
 }
 
@@ -312,10 +346,13 @@ async function attach(hostId: string, status: HostStatus) {
     void reconnect(hostId);
     return;
   }
+  // Agents on this machine can reach the other machines' scheduled tasks through us.
+  c.send({ t: 'relay-ready' });
   // Threads that were open before a reconnect may have missed events; reload them.
   for (const tv of Object.values(state.threads)) {
     if (tv.hostId === hostId && !tv.loading) void loadThread(hostId, tv.threadId, true);
   }
+  void refreshSchedule(hostId);
   void refreshModels(hostId);
   void refreshThreads(hostId).then(() => refreshThreads(hostId, true));
 }
@@ -414,6 +451,10 @@ setInterval(() => {
 // ---------- events ----------
 
 function onHostMessage(hostId: string, msg: HostMessage) {
+  if (msg.t === 'relay') {
+    void relay(hostId, msg.id, msg.request);
+    return;
+  }
   if (msg.t === 'req') {
     updateHost(hostId, (h) => ({ requests: [...h.requests.filter((r) => r.id !== msg.id), { id: msg.id, method: msg.method, params: msg.params }] }));
     return;
@@ -448,6 +489,9 @@ function onHostMessage(hostId: string, msg: HostMessage) {
     case 'browser/download':
       updateHost(hostId, (h) => ({ downloads: [params, ...h.downloads.filter((d) => d.id !== params.id)].slice(0, 50) }));
       if (params.state === 'completed') toast(`Downloaded ${params.filename} → ${params.path}`);
+      return;
+    case 'schedule/changed':
+      setSchedule(hostId, params as ScheduleSnapshot);
       return;
     case 'browser/popup':
       if (params.threadId) setState((s) => ({ browserTab: { ...s.browserTab, [threadKey(hostId, params.threadId)]: params.tabId } }));
@@ -603,7 +647,7 @@ function mergeItems(prev: ThreadItem[], incoming: ThreadItem[]) {
 // ---------- threads ----------
 
 export async function openThread(hostId: string, threadId: string | null) {
-  setState({ selection: { hostId, threadId } });
+  setState({ selection: { hostId, threadId }, view: 'thread' });
   if (threadId && !state.threads[threadKey(hostId, threadId)]) await loadThread(hostId, threadId);
 }
 
@@ -875,5 +919,117 @@ export async function openTab(sel: Selection, url?: string) {
     }));
   } catch (err) {
     toast((err as Error).message);
+  }
+}
+
+// ---------- scheduled tasks ----------
+
+function setSchedule(hostId: string, snapshot: ScheduleSnapshot) {
+  updateHost(hostId, () => ({ schedule: snapshot, clockSkew: Date.now() - snapshot.now }));
+}
+
+export async function refreshSchedule(hostId: string) {
+  try {
+    const snapshot = await conn(hostId)?.rpc<ScheduleSnapshot>('schedule/list');
+    if (snapshot) setSchedule(hostId, snapshot);
+  } catch {
+    // an older host without schedules; it is upgraded on the next connect
+  }
+}
+
+/** What the editor sends; see TaskInput on the host. */
+export interface TaskFields {
+  name: string;
+  prompt: string;
+  /** Left out when editing keeps the schedule as it is. */
+  schedule?: ScheduleInput;
+  target: { type: 'thread'; threadId: string } | { type: 'newThread'; cwd: string };
+  model: string | null;
+  effort: string | null;
+  access: TaskAccess;
+}
+
+export async function saveTask(hostId: string, taskId: string | null, fields: TaskFields): Promise<ScheduledTask | null> {
+  const c = conn(hostId);
+  if (!c) {
+    toast('Machine is not connected');
+    return null;
+  }
+  try {
+    const res = taskId
+      ? await c.rpc<{ task: ScheduledTask }>('schedule/update', { id: taskId, patch: fields })
+      : await c.rpc<{ task: ScheduledTask }>('schedule/create', { task: fields });
+    return res.task;
+  } catch (err) {
+    toast((err as Error).message);
+    return null;
+  }
+}
+
+async function scheduleCall(hostId: string, method: string, params: unknown) {
+  try {
+    await conn(hostId)?.rpc(method, params);
+  } catch (err) {
+    toast((err as Error).message);
+  }
+}
+
+export const deleteTask = (hostId: string, id: string) => scheduleCall(hostId, 'schedule/delete', { id });
+export const runTaskNow = (hostId: string, id: string) => scheduleCall(hostId, 'schedule/run', { id });
+export const setTaskStatus = (hostId: string, id: string, status: 'active' | 'paused') => scheduleCall(hostId, 'schedule/update', { id, patch: { status } });
+export const markRunsRead = (hostId: string, ids: string[] | 'all') => scheduleCall(hostId, 'schedule/read', ids === 'all' ? { all: true } : { ids });
+
+export function openRun(hostId: string, run: ScheduledRun) {
+  if (!run.read) void markRunsRead(hostId, [run.id]);
+  if (run.threadId) void openThread(hostId, run.threadId);
+}
+
+/** Unread runs on all machines, for the sidebar badge. */
+export function unreadRuns(s: AppState) {
+  let n = 0;
+  for (const id of s.hostOrder) n += s.hosts[id]?.schedule?.runs.filter((r) => !r.read && r.status !== 'running' && r.status !== 'waiting').length ?? 0;
+  return n;
+}
+
+/** Finds the machine an agent means, by the name the app shows, its hostname or its SSH target. */
+function resolveMachine(name: string): string {
+  const wanted = name.trim().toLowerCase();
+  const keys: Array<(h: HostView) => string | null | undefined> = [(h) => hostLabel(h), (h) => h.name, (h) => h.info?.hostname, (h) => h.target, (h) => h.id];
+  for (const key of keys) {
+    const hits = state.hostOrder.filter((id) => key(state.hosts[id])?.toLowerCase() === wanted);
+    if (hits.length === 1) return hits[0];
+    if (hits.length > 1) throw new Error(`"${name}" matches several machines; use the SSH target or hostname instead`);
+  }
+  const known = state.hostOrder.map((id) => hostLabel(state.hosts[id])).join(', ');
+  throw new Error(`No machine named "${name}" (machines: ${known})`);
+}
+
+/** Lets an agent on one machine manage scheduled tasks on the others through this app. */
+async function relay(fromHostId: string, id: number, request: RelayRequest) {
+  const from = conn(fromHostId);
+  if (!from) return;
+  try {
+    let result: unknown;
+    if (request.op === 'machines') {
+      result = state.hostOrder.map(
+        (hostId): RelayMachine => ({
+          name: hostLabel(state.hosts[hostId]),
+          hostname: state.hosts[hostId].info?.hostname ?? null,
+          type: state.hosts[hostId].type,
+          connected: conn(hostId)?.state === 'open',
+          current: hostId === fromHostId,
+        }),
+      );
+    } else {
+      // Only scheduled tasks travel between machines; nothing else of the target's API.
+      if (!request.method.startsWith('schedule/')) throw new Error(`${request.method} cannot be sent to another machine`);
+      const target = resolveMachine(request.machine);
+      const c = conn(target);
+      if (!c || c.state !== 'open') throw new Error(`${hostLabel(state.hosts[target])} is not connected to the BetterCodex app right now`);
+      result = await c.rpc(request.method, request.params);
+    }
+    from.send({ t: 'relayres', id, result });
+  } catch (err) {
+    from.send({ t: 'relayres', id, error: { code: (err as RpcFailure).code ?? -32000, message: (err as Error).message } });
   }
 }
