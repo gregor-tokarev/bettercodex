@@ -19,6 +19,11 @@ export const paths = {
   log: path.join(BC_HOME, 'host.log'),
   /** How to start the BetterCodex app installed on this machine, recorded when it registers. */
   app: path.join(BC_HOME, 'app.json'),
+  /** Scheduled tasks and their recent runs. */
+  schedules: path.join(BC_HOME, 'schedules.json'),
+  /** Per-task folders holding the memory file new-thread runs keep between runs. */
+  tasks: path.join(BC_HOME, 'tasks'),
+  machineId: path.join(BC_HOME, 'machine-id'),
 };
 
 export function ensureDirs() {
@@ -74,6 +79,19 @@ export function loadSecrets(): Secrets {
   };
   writeJson(paths.secrets, secrets);
   return secrets;
+}
+
+/** Identifies this host to the others, unlike hostnames, which machines may share. */
+export function machineId(): string {
+  try {
+    const id = fs.readFileSync(paths.machineId, 'utf8').trim();
+    if (id) return id;
+  } catch {
+    // first run
+  }
+  const id = crypto.randomUUID();
+  fs.writeFileSync(paths.machineId, id, { mode: 0o600 });
+  return id;
 }
 
 export function readRuntimeInfo(): HostRuntimeInfo | null {

@@ -1,4 +1,4 @@
-import { WS_SUBPROTOCOL, type HostMessage } from '../../shared/types';
+import { WS_SUBPROTOCOL, type ClientMessage, type HostMessage } from '../../shared/types';
 import { bc } from './bridge';
 
 type Listener = (msg: HostMessage) => void;
@@ -96,6 +96,10 @@ export class HostConnection {
       this.pending.set(id, { resolve, reject });
       this.ws!.send(JSON.stringify({ t: 'rpc', id, method, params }));
     });
+  }
+
+  send(msg: ClientMessage) {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
   }
 
   respond(id: string | number, result: unknown) {

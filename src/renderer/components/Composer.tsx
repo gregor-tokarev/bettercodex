@@ -4,8 +4,9 @@ import { effectiveSettings, interrupt, sendMessage, setComposerSetting, toast, u
 import { HostImage } from './Items';
 import { IconArrowUp, IconBrain, IconPaperclip, IconShield, IconSparkle, IconStop, IconX } from './Icons';
 import { Dropdown } from './Menu';
+import { SendLater } from './Scheduled';
 
-const EFFORT_LABELS: Record<string, string> = {
+export const EFFORT_LABELS: Record<string, string> = {
   none: 'None',
   minimal: 'Minimal',
   low: 'Low',
@@ -16,7 +17,7 @@ const EFFORT_LABELS: Record<string, string> = {
   ultra: 'Ultra',
 };
 
-const ACCESS_OPTIONS: Array<{ value: AccessMode; label: string; description: string }> = [
+export const ACCESS_OPTIONS: Array<{ value: AccessMode; label: string; description: string }> = [
   { value: 'read-only', label: 'Read only', description: 'Reads files; asks before edits and commands' },
   { value: 'auto', label: 'Default', description: 'Edits the project; asks for network or outside access' },
   { value: 'full', label: 'Full access', description: 'No sandbox and no approval prompts' },
@@ -127,6 +128,17 @@ export function Composer({ hostId, threadId, children }: { hostId: string; threa
           <button className="icon-button" title="Attach images" onClick={attach}>
             <IconPaperclip size={15} />
           </button>
+          {threadId && (
+            <SendLater
+              hostId={hostId}
+              threadId={threadId}
+              text={text}
+              onScheduled={() => {
+                setText('');
+                drafts.delete(key);
+              }}
+            />
+          )}
           <Dropdown
             header="Model"
             icon={<IconSparkle size={13} />}

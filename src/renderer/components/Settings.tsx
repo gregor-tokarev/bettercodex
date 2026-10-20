@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { HostConfig } from '../../shared/types';
 import { bc } from '../lib/bridge';
-import { conn, connectHost, hostLabel, setPrefs, setState, toast, useStore } from '../lib/store';
+import { conn, connectHost, hostLabel, installUpdate, setPrefs, setState, toast, useStore } from '../lib/store';
 import { StatusDot } from './HostSwitcher';
 import { IconX } from './Icons';
 
@@ -187,6 +187,63 @@ function HostConfigForm({ hostId }: { hostId: string }) {
   );
 }
 
+function UpdateSettings() {
+  const update = useStore((s) => s.update);
+  if (!update) return null;
+  const { available, state } = update;
+  const busy = state === 'downloading' || state === 'installing';
+  return (
+    <div className="settings-form">
+      <div className="kv">
+        <span>Version</span>
+        <span>{update.current}</span>
+        {update.mode !== 'off' && (
+          <>
+            <span>Latest</span>
+            <span>
+              {state === 'checking'
+                ? 'Checking…'
+                : available
+                  ? `${available.name}, released ${new Date(available.publishedAt).toLocaleString()}`
+                  : update.checkedAt
+                    ? 'You have the latest build'
+                    : 'Not checked yet'}
+            </span>
+          </>
+        )}
+      </div>
+      {update.note && <p className="muted small">{update.note}</p>}
+      {update.installError && <p className="muted small">{update.installError}</p>}
+      {update.error && <p className="muted small">{update.error}</p>}
+      {update.mode !== 'off' && (
+        <div className="form-actions left">
+          <button className="btn" disabled={state !== 'idle'} onClick={() => void bc.updates.check()}>
+            Check for updates
+          </button>
+          {available && (
+            <button className="btn primary" disabled={busy} onClick={() => void installUpdate()}>
+              {state === 'downloading'
+                ? `Downloading… ${Math.round((update.progress ?? 0) * 100)}%`
+                : state === 'installing'
+                  ? 'Installing…'
+                  : state === 'ready'
+                    ? 'Restart to update'
+                    : update.mode === 'manual'
+                      ? 'Open download page'
+                      : 'Update and restart'}
+            </button>
+          )}
+          {available?.compareUrl && (
+            <button className="btn" onClick={() => void bc.openExternal(available.compareUrl!)}>
+              What's new
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function Settings() {
   const open = useStore((s) => s.settingsOpen);
   const hosts = useStore((s) => s.hosts);
@@ -278,6 +335,8 @@ export function Settings() {
               <option value="stream">Live stream of the other machine's browser</option>
             </select>
           </label>
+          <h3>Updates</h3>
+          <UpdateSettings />
         </div>
       </div>
     </div>

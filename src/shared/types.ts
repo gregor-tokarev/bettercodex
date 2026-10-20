@@ -1,5 +1,7 @@
 // Wire types shared by the host daemon, the Electron main process and the renderer.
 
+import type { ScheduleSpec } from './schedule.js';
+
 declare const __BUILD_ID__: string | undefined;
 
 /** Includes a hash of the host sources so clients redeploy/restart hosts after any change. */
@@ -117,16 +119,113 @@ export interface AppBrowserRegistration {
   sandboxed?: boolean;
 }
 
+// ---- scheduled tasks ----
+
+/** Permissions of a scheduled run, like the composer's: read only, default (workspace write) or full access. */
+export type TaskAccess = 'read-only' | 'auto' | 'full';
+
+export type TaskTarget =
+  /** Sends the prompt to an existing thread, which keeps its context and settings. */
+  | { type: 'thread'; threadId: string }
+  /** Starts a fresh thread in `cwd` for every run. */
+  | { type: 'newThread'; cwd: string };
+
+/** The agent thread that created or last changed a task; null when the user did it in the app. */
+export interface TaskActor {
+  /** Hostname, for people. */
+  machine: string;
+  /** Stable id of the agent's BetterCodex host. */
+  machineId: string;
+  threadId: string;
+  sandboxMode: string | null;
+}
+
+/** What a thread may do: its sandbox level, network access and the folders it can write. */
+export interface TaskPermissions {
+  level: TaskAccess;
+  network: boolean;
+  roots: string[];
+}
+
+/** The permissions of the agent thread that last set a task's prompt or destination. */
+export type TaskGrant = TaskPermissions & { machineId: string; threadId: string };
+
+export interface ScheduledTask {
+  id: string;
+  name: string;
+  prompt: string;
+  schedule: ScheduleSpec;
+  target: TaskTarget;
+  /** New-thread runs; null uses the machine's Codex defaults. */
+  model: string | null;
+  effort: string | null;
+  /** New-thread runs get these permissions; for a thread target, the thread's own when the task was made. */
+  access: TaskAccess;
+  status: 'active' | 'paused' | 'completed';
+  nextRunAt: number | null;
+  lastRunAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+  createdBy: TaskActor | null;
+  /** Messages into another thread must stay within this; null when the user set the prompt and destination. */
+  grant: TaskGrant | null;
+}
+
+export interface ScheduledRun {
+  id: string;
+  taskId: string;
+  taskName: string;
+  trigger: 'schedule' | 'manual';
+  scheduledFor: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+  /** waiting = the target thread is busy; the message goes in once its turn ends. */
+  status: 'waiting' | 'running' | 'completed' | 'failed' | 'interrupted';
+  threadId: string | null;
+  turnId: string | null;
+  /** The run's last agent message. */
+  summary: string | null;
+  error: string | null;
+  read: boolean;
+}
+
+/** Everything the app shows for one machine's schedule (`schedule/list`, `schedule/changed`). */
+export interface ScheduleSnapshot {
+  hostname: string;
+  timezone: string;
+  now: number;
+  tasks: ScheduledTask[];
+  runs: ScheduledRun[];
+}
+
+/**
+ * A host asks the app to reach the other machines it is connected to, so agents can manage
+ * tasks everywhere. `current` marks the machine that asked.
+ */
+export type RelayRequest = { op: 'machines' } | { op: 'call'; machine: string; method: string; params: unknown };
+
+export interface RelayMachine {
+  name: string;
+  hostname: string | null;
+  type: 'local' | 'ssh';
+  connected: boolean;
+  current: boolean;
+}
+
 // ---- main websocket (/ws): JSON text frames ----
 
 export type ClientMessage =
   | { t: 'rpc'; id: number; method: string; params?: unknown }
-  | { t: 'reqres'; id: string | number; result?: unknown; error?: { code: number; message: string } };
+  | { t: 'reqres'; id: string | number; result?: unknown; error?: { code: number; message: string } }
+  /** The client can relay requests to the other machines it is connected to. */
+  | { t: 'relay-ready' }
+  | { t: 'relayres'; id: number; result?: unknown; error?: { code: number; message: string } };
 
 export type HostMessage =
   | { t: 'res'; id: number; result?: unknown; error?: { code: number; message: string; data?: unknown } }
   | { t: 'notif'; method: string; params: unknown }
-  | { t: 'req'; id: string | number; method: string; params: unknown };
+  | { t: 'req'; id: string | number; method: string; params: unknown }
+  | { t: 'relay'; id: number; request: RelayRequest };
 
 // ---- browser stream websocket (/stream) ----
 
@@ -167,3 +266,27 @@ export type StreamHostMessage =
   | { t: 'cursor'; cursor: string }
   | { t: 'clipboard'; text: string }
   | { t: 'error'; message: string };
+
+/** The app's self-update, as shown in the renderer. */
+export interface UpdateStatus {
+  /** This build's release name, e.g. v0.0.1-660c757e94 (the bare version for builds made outside CI). */
+  current: string;
+  /**
+   * How this copy updates: in place (the .app on macOS, the AppImage on Linux), from the release page
+   * (a .deb install, a quarantined Mac app) or not at all (development builds, builds made outside CI).
+   */
+  mode: 'inPlace' | 'manual' | 'off';
+  /** Why the copy cannot update in place. */
+  note: string | null;
+  /** `ready`: downloaded and unpacked, waiting for the restart that puts it in place. */
+  state: 'idle' | 'checking' | 'downloading' | 'installing' | 'ready';
+  /** A newer release than this build, if there is one. */
+  available: { name: string; url: string; compareUrl: string | null; publishedAt: string } | null;
+  /** Downloaded fraction while downloading. */
+  progress: number | null;
+  /** The last failed check. */
+  error: string | null;
+  /** The last failed install, including one that rolled back after a restart. */
+  installError: string | null;
+  checkedAt: number | null;
+}

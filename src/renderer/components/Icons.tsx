@@ -158,6 +158,34 @@ export const IconLink = (p: P) => (
   </Svg>
 );
 
+export const IconClock = (p: P) => (
+  <Svg {...p}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 7v5l3 2" />
+  </Svg>
+);
+export const IconPlay = (p: P) => (
+  <Svg {...p}>
+    <path d="M7 5v14l11-7Z" />
+  </Svg>
+);
+export const IconPause = (p: P) => (
+  <Svg {...p}>
+    <path d="M9 5v14M15 5v14" />
+  </Svg>
+);
+export const IconTrash = (p: P) => (
+  <Svg {...p}>
+    <path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3" />
+  </Svg>
+);
+export const IconAlert = (p: P) => (
+  <Svg {...p}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 8v5M12 16h.01" />
+  </Svg>
+);
+
 export function Spinner({ size = 14 }: { size?: number }) {
   return <span className="spinner" style={{ width: size, height: size }} />;
 }

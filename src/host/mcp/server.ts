@@ -4,10 +4,18 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { HOST_VERSION } from '../../shared/types.js';
 import { errorMessage, log } from '../log.js';
-import { browserInstructions } from './instructions.js';
-import type { BrowserTools, ToolContext } from './tools.js';
+import type { ToolContext, ToolResult } from './tools.js';
 
 export const MCP_SERVER_NAME = 'browser';
+export const SCHEDULER_SERVER_NAME = 'scheduler';
+
+/** One MCP server the host offers to Codex threads (the browser, the scheduler). */
+export interface ToolServer {
+  name: string;
+  instructions(): string;
+  list(): unknown[];
+  call(name: string, args: unknown, ctx: ToolContext): Promise<ToolResult>;
+}
 
 /** Codex attaches the calling thread to every tool call's `_meta`. */
 function contextFrom(meta: any): ToolContext {
@@ -26,7 +34,7 @@ function safeJson(s: string) {
 }
 
 /** Stateless Streamable-HTTP MCP endpoint: every POST gets a fresh server bound to the shared tools. */
-export async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, tools: BrowserTools) {
+export async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse, tools: ToolServer) {
   if (req.method !== 'POST') {
     res.writeHead(405, { Allow: 'POST' }).end();
     return;
@@ -40,10 +48,7 @@ export async function handleMcp(req: http.IncomingMessage, res: http.ServerRespo
     res.writeHead(400).end('invalid json');
     return;
   }
-  const server = new Server(
-    { name: 'bettercodex-browser', version: HOST_VERSION },
-    { capabilities: { tools: {} }, instructions: browserInstructions() },
-  );
+  const server = new Server({ name: `bettercodex-${tools.name}`, version: HOST_VERSION }, { capabilities: { tools: {} }, instructions: tools.instructions() });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools.list() as any }));
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const ctx = contextFrom(request.params._meta);
