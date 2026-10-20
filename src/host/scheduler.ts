@@ -284,7 +284,8 @@ export class Scheduler extends EventEmitter {
     const task = this.require(id);
     const what = changes.prompt !== undefined || changes.target !== undefined || (changes.access !== undefined && changes.access !== task.access);
     Object.assign(task, changes, { updatedAt: now });
-    if (what) task.grant = grant;
+    // Saving the prompt or destination in the app approves them as they are, changed or not.
+    if (what || (!actor && (patch.prompt !== undefined || patch.target !== undefined))) task.grant = grant;
     let reschedule = false;
     if (schedule) {
       task.schedule = schedule;
