@@ -300,7 +300,9 @@ export class HostServer {
     const result = await this.codex.request(method, { ...params, config: await this.threadConfig(params.config, params.cwd) });
     const threadId: string | undefined = result?.thread?.id;
     if (!threadId || this.briefed.has(threadId)) return result;
-    if (method === 'thread/start' || (method === 'thread/fork' && this.briefed.has(params.threadId))) this.markBriefed(threadId, true);
+    // A fork cut at an earlier turn may end before the rule was appended to its parent.
+    const wholeFork = method === 'thread/fork' && !params.lastTurnId && !params.beforeTurnId && this.briefed.has(params.threadId);
+    if (method === 'thread/start' || wholeFork) this.markBriefed(threadId, true);
     else await this.brief(threadId);
     return result;
   }
