@@ -7,7 +7,14 @@ import { Spinner } from './Icons';
 type Bounds = { x: number; y: number; width: number; height: number };
 
 /** Elements drawn over the panel; native views sit above all page content, so they step aside for them. */
-const OVERLAYS = '.popover, .modal-backdrop';
+const OVERLAYS = '.popover, .modal-backdrop, .omnibox-popup';
+
+/** A view to give the keyboard to once it is on screen (switching tabs from the keyboard in a page). */
+let pendingFocus: string | null = null;
+
+export function focusWhenShown(surface: string) {
+  pendingFocus = surface;
+}
 
 function covered(rect: DOMRect) {
   for (const el of document.querySelectorAll(OVERLAYS)) {
@@ -25,12 +32,14 @@ function NativeSurface({
   surface,
   show,
   capture,
+  focus,
   children,
 }: {
   /** Identifies the view; null while there is none to show. */
   surface: string | null;
   show: (bounds: Bounds | null) => Promise<boolean>;
   capture: () => Promise<string | null>;
+  focus: () => void;
   children?: ReactNode;
 }) {
   const box = useRef<HTMLDivElement>(null);
@@ -60,7 +69,11 @@ function NativeSurface({
               void show(null);
             });
           } else {
-            void show({ x: r.left, y: r.top, width: r.width, height: r.height });
+            void show({ x: r.left, y: r.top, width: r.width, height: r.height }).then((shown) => {
+              if (!shown || !alive || pendingFocus !== surface) return;
+              pendingFocus = null;
+              focus();
+            });
             setBackdrop(null);
           }
         }
@@ -104,7 +117,12 @@ export function NativeViewport({ connection, tab }: { connection: HostConnection
 
   const targetId = tab.targetId ?? null;
   return (
-    <NativeSurface surface={targetId} show={(b) => bc.appBrowser.show(targetId, b)} capture={() => (targetId ? bc.appBrowser.capture(targetId) : Promise.resolve(null))}>
+    <NativeSurface
+      surface={targetId}
+      show={(b) => bc.appBrowser.show(targetId, b)}
+      capture={() => (targetId ? bc.appBrowser.capture(targetId) : Promise.resolve(null))}
+      focus={() => targetId && void bc.pageView.focus({ targetId })}
+    >
       {tab.sleeping && !waking && !error ? (
         <div className="viewport-overlay interactive">
           <button className="btn" onClick={wake}>
@@ -153,6 +171,7 @@ export function ReplicaViewport({ hostId, tab, hostName, sameMachine }: { hostId
       surface={gone ? null : `${hostId}/${tab.id}`}
       show={(b) => bc.replica.show(hostId, tab.id, b, sameMachine)}
       capture={() => bc.replica.capture(hostId, tab.id)}
+      focus={() => void bc.pageView.focus({ hostId, tabId: tab.id })}
     >
       {gone ? (
         <div className="viewport-overlay interactive column">

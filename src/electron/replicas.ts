@@ -29,7 +29,7 @@ import {
   type SyncState,
 } from '../shared/syncPage.js';
 import type { HostManager } from './hosts.js';
-import { handlePageKeys, showPageMenu, type PageNavigation } from './pageChrome.js';
+import { handleNavButton, handlePageKeys, showPageMenu, type PageNavigation } from './pageChrome.js';
 import { ViewStage, type Rect } from './stage.js';
 
 const PAGE_OP = syncPageOp.toString();
@@ -165,6 +165,8 @@ interface Replica {
   dialogAnswers: Array<DialogKey & { accept: boolean; value: string | null; at: number }>;
   /** While the owner's field values are put into the copy's page; what the page sends then is held. */
   restoringUntil: number;
+  /** Set while the owner's key presses are replayed here; they are not the person's shortcuts. */
+  replayingKeys: boolean;
 }
 
 /** One sync connection per machine. */
@@ -274,6 +276,10 @@ export class ReplicaManager extends EventEmitter {
       if (replica) replica.lastActionAt = Date.now();
       event.returnValue = true;
     });
+    ipcMain.on('bc:nav', (event, action) => {
+      const replica = this.byContents.get(event.sender.id);
+      if (replica) handleNavButton(action, this.navigation(replica));
+    });
     ipcMain.on('bc:replica-dialog', (event, d: { type: string; message: string }) => this.onDialog(event, d));
     ipcMain.on('bc:replica-socket', (event, msg: { op: 'open'; sid: number; url: string } | { op: 'close'; sid: number }) => this.onCopySocket(event, msg));
     setInterval(() => {
@@ -312,6 +318,12 @@ export class ReplicaManager extends EventEmitter {
   reload(hostId: string, tabId: string) {
     const replica = this.replicas.get(key(hostId, tabId));
     if (replica) this.subscribe(replica);
+  }
+
+  /** The copy's page, for the panel's find bar, zoom and focus. */
+  contents(hostId: string, tabId: string) {
+    const wc = this.replicas.get(key(hostId, tabId))?.wc;
+    return wc && !wc.isDestroyed() ? wc : null;
   }
 
   statusOf(hostId: string, tabId: string) {
@@ -378,6 +390,7 @@ export class ReplicaManager extends EventEmitter {
       ownerDialogs: [],
       dialogAnswers: [],
       restoringUntil: 0,
+      replayingKeys: false,
     };
     this.replicas.set(key(hostId, tabId), replica);
     this.byContents.set(replica.wcId, replica);
@@ -474,7 +487,8 @@ export class ReplicaManager extends EventEmitter {
     wc.setWindowOpenHandler(() => ({ action: 'deny' }));
     wc.on('will-prevent-unload', (event) => event.preventDefault());
     wc.on('context-menu', (_e, params) => showPageMenu(wc, params, this.uiWindow(), nav, { newTab: false }));
-    wc.on('before-input-event', (event, input) => handlePageKeys(event, input, this.uiWindow(), nav));
+    wc.on('before-input-event', (event, input) => handlePageKeys(event, input, this.uiWindow(), nav, wc, () => replica.replayingKeys));
+    wc.on('found-in-page', (_e, result) => this.uiWindow()?.webContents.send('pageView:found', result));
     wc.on('did-start-loading', () => {
       replica.loading = true;
     });
@@ -1174,9 +1188,15 @@ export class ReplicaManager extends EventEmitter {
         const keyCode = KEY_CODES[action.key] ?? action.key;
         const modifiers = inputModifiers(action.modifiers);
         expectEcho(action);
-        wc.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
-        if (action.key === 'Enter' || action.key === 'Space') wc.sendInputEvent({ type: 'char', keyCode: action.key === 'Enter' ? '\r' : ' ', modifiers });
-        wc.sendInputEvent({ type: 'keyUp', keyCode, modifiers });
+        // Electron reports these to before-input-event synchronously, so the flag marks exactly them.
+        replica.replayingKeys = true;
+        try {
+          wc.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
+          if (action.key === 'Enter' || action.key === 'Space') wc.sendInputEvent({ type: 'char', keyCode: action.key === 'Enter' ? '\r' : ' ', modifiers });
+          wc.sendInputEvent({ type: 'keyUp', keyCode, modifiers });
+        } finally {
+          replica.replayingKeys = false;
+        }
         return;
       }
       case 'scroll':

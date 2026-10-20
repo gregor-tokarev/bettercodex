@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { FrameHeader, StreamClientMessage, StreamHostMessage } from '../../shared/types';
+import { browserAction } from '../../shared/browserKeys';
 import { bc, isMac } from '../lib/bridge';
 import type { HostConnection } from '../lib/connection';
 import { Spinner } from './Icons';
@@ -14,13 +15,39 @@ const BUTTONS = ['left', 'middle', 'right', 'back', 'forward'] as const;
  * Live view of one remote tab: draws screencast frames on a canvas and forwards
  * mouse, wheel, keyboard, IME and clipboard input to the host's browser.
  */
-export function BrowserViewport({ connection, tabId, hostPlatform, onFocusUrl }: { connection: HostConnection; tabId: string; hostPlatform: string; onFocusUrl: () => void }) {
+/** The smallest viewport the host gives a streamed page; zoom stops where the panel would need less. */
+const MIN_VIEWPORT = { width: 240, height: 200 };
+
+/** The largest zoom a panel of this size can show (zooming shrinks the page's viewport). */
+export function maxStreamZoom(width: number, height: number) {
+  return Math.min(width / MIN_VIEWPORT.width, height / MIN_VIEWPORT.height);
+}
+
+/**
+ * `zoom` makes the page larger the way browser zoom does: its viewport gets smaller and is shown
+ * scaled up. `onMaxZoom` reports how far that can go in the panel's current size.
+ */
+export function BrowserViewport({
+  connection,
+  tabId,
+  hostPlatform,
+  zoom = 1,
+  onMaxZoom,
+}: {
+  connection: HostConnection;
+  tabId: string;
+  hostPlatform: string;
+  zoom?: number;
+  onMaxZoom?: (max: number) => void;
+}) {
   const container = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const ws = useRef<WebSocket | null>(null);
   const frame = useRef<{ cssWidth: number; cssHeight: number; rect: { x: number; y: number; w: number; h: number } } | null>(null);
   const held = useRef(new Set<string>());
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // A Mac keyboard driving a Linux browser: Cmd shortcuts become Ctrl shortcuts.
@@ -89,7 +116,10 @@ export function BrowserViewport({ connection, tabId, hostPlatform, onFocusUrl }:
     let closed = false;
     const attach = () => {
       const box = container.current;
-      send({ t: 'attach', tabId, width: box?.clientWidth ?? 1000, height: box?.clientHeight ?? 700 });
+      const width = box?.clientWidth ?? 1000;
+      const height = box?.clientHeight ?? 700;
+      const z = Math.min(zoomRef.current, maxStreamZoom(width, height));
+      send({ t: 'attach', tabId, width: width / z, height: height / z });
     };
     socket.onopen = attach;
     socket.onmessage = (event) => {
@@ -120,21 +150,28 @@ export function BrowserViewport({ connection, tabId, hostPlatform, onFocusUrl }:
     };
   }, [connection, tabId]);
 
-  // keep the remote viewport the size of the panel
+  // keep the remote viewport the size of the panel (divided by the zoom)
   useEffect(() => {
     const box = container.current;
     if (!box) return;
     let timer: ReturnType<typeof setTimeout>;
+    const resize = () => {
+      const max = maxStreamZoom(box.clientWidth, box.clientHeight);
+      onMaxZoom?.(max);
+      const z = Math.min(zoomRef.current, max);
+      send({ t: 'resize', width: Math.floor(box.clientWidth / z), height: Math.floor(box.clientHeight / z) });
+    };
     const observer = new ResizeObserver(() => {
       clearTimeout(timer);
-      timer = setTimeout(() => send({ t: 'resize', width: Math.floor(box.clientWidth), height: Math.floor(box.clientHeight) }), 120);
+      timer = setTimeout(resize, 120);
     });
     observer.observe(box);
+    resize();
     return () => {
       observer.disconnect();
       clearTimeout(timer);
     };
-  }, [tabId]);
+  }, [tabId, zoom]);
 
   const toRemote = (e: { clientX: number; clientY: number }) => {
     const f = frame.current;
@@ -218,11 +255,9 @@ export function BrowserViewport({ connection, tabId, hostPlatform, onFocusUrl }:
     if (e.nativeEvent.isComposing || e.keyCode === 229) return; // IME composition in progress
     const shortcut = isMac ? e.metaKey : e.ctrlKey;
     const lower = keyName(e).toLowerCase();
-    if (shortcut && lower === 'l') {
-      e.preventDefault();
-      onFocusUrl();
-      return;
-    }
+    // Browser shortcuts are left alone here: the app window runs them in the browser panel. Esc also goes to the page.
+    const action = browserAction({ key: e.key, code: e.code, ctrl: e.ctrlKey, meta: e.metaKey, alt: e.altKey, shift: e.shiftKey }, isMac);
+    if (action && action.type !== 'stop') return;
     if (shortcut && lower === 'v' && !e.shiftKey) {
       e.preventDefault();
       const text = await bc.clipboard.read();

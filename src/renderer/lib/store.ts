@@ -22,6 +22,7 @@ import type { TurnPlanStep } from '../../shared/codex-protocol/v2/TurnPlanStep';
 import type { UserInput } from '../../shared/codex-protocol/v2/UserInput';
 import { bc, type HostListEntry, type HostStatus } from './bridge';
 import { HostConnection, type RpcFailure } from './connection';
+import { noteTabs } from './history';
 
 export type AccessMode = 'read-only' | 'auto' | 'full';
 
@@ -75,6 +76,8 @@ export interface ThreadView {
   loadingOlder: boolean;
   error: string | null;
   activeTurnId: string | null;
+  /** Stop was pressed and the running turn has not ended yet. */
+  stopping: boolean;
   plan: { explanation: string | null; steps: TurnPlanStep[] } | null;
   tokenUsage: ThreadTokenUsage | null;
   retrying: string | null;
@@ -473,7 +476,7 @@ function onHostMessage(hostId: string, msg: HostMessage) {
         // A restarted app-server forgot which threads were loaded and which turns were running.
         setState((s) => {
           const threads = { ...s.threads };
-          for (const [k, tv] of Object.entries(threads)) if (tv.hostId === hostId) threads[k] = { ...tv, resumed: false, activeTurnId: null };
+          for (const [k, tv] of Object.entries(threads)) if (tv.hostId === hostId) threads[k] = { ...tv, resumed: false, activeTurnId: null, stopping: false };
           return { threads };
         });
         for (const tv of Object.values(state.threads)) if (tv.hostId === hostId) void loadThread(hostId, tv.threadId, true);
@@ -482,6 +485,7 @@ function onHostMessage(hostId: string, msg: HostMessage) {
     }
     case 'browser/tabs': {
       const before = state.hosts[hostId]?.tabs ?? [];
+      noteTabs(before, params.tabs);
       updateHost(hostId, () => ({ tabs: params.tabs }));
       maybeAutoOpenBrowser(hostId, params.tabs, before);
       return;
@@ -570,12 +574,13 @@ function upsertItem(turns: TurnView[], turnId: string, item: ThreadItem): TurnVi
 function applyThreadEvent(key: string, method: string, p: any) {
   switch (method) {
     case 'turn/started':
-      updateThread(key, (tv) => ({ turns: upsertTurn(tv.turns, turnFrom(p.turn, tv.turns)), activeTurnId: p.turn.id, retrying: null }));
+      updateThread(key, (tv) => ({ turns: upsertTurn(tv.turns, turnFrom(p.turn, tv.turns)), activeTurnId: p.turn.id, stopping: false, retrying: null }));
       return;
     case 'turn/completed':
       updateThread(key, (tv) => ({
         turns: upsertTurn(tv.turns, turnFrom(p.turn, tv.turns)),
         activeTurnId: tv.activeTurnId === p.turn.id ? null : tv.activeTurnId,
+        stopping: tv.activeTurnId === p.turn.id ? false : tv.stopping,
         retrying: null,
       }));
       return;
@@ -663,6 +668,7 @@ export async function loadThread(hostId: string, threadId: string, reload = fals
     loadingOlder: false,
     error: null,
     activeTurnId: null,
+    stopping: false,
     plan: null,
     tokenUsage: null,
     retrying: null,
@@ -682,7 +688,7 @@ export async function loadThread(hostId: string, threadId: string, reload = fals
     });
     const turns = res.data.reverse().map((t) => turnFrom(t, []) as TurnView);
     const active = [...turns].reverse().find((t) => t.status === 'inProgress');
-    updateThread(key, () => ({ turns, olderCursor: res.nextCursor, loading: false, activeTurnId: active?.id ?? null }));
+    updateThread(key, (cur) => ({ turns, olderCursor: res.nextCursor, loading: false, activeTurnId: active?.id ?? null, stopping: active ? cur.stopping : false }));
   } catch (err) {
     updateThread(key, () => ({ loading: false, error: (err as Error).message }));
   }
@@ -792,6 +798,7 @@ export async function sendMessage(hostId: string, threadId: string | null, text:
             loadingOlder: false,
             error: null,
             activeTurnId: null,
+            stopping: false,
             plan: null,
             tokenUsage: null,
             retrying: null,
@@ -846,13 +853,46 @@ export async function sendMessage(hostId: string, threadId: string | null, text:
 }
 
 export async function interrupt(hostId: string, threadId: string) {
-  const tv = state.threads[threadKey(hostId, threadId)];
+  const key = threadKey(hostId, threadId);
+  const tv = state.threads[key];
+  const c = conn(hostId);
   if (!tv?.activeTurnId) return;
+  if (!c) {
+    toast('Host is not connected');
+    return;
+  }
+  const shown = tv.activeTurnId;
+  updateThread(key, () => ({ stopping: true }));
   try {
-    await conn(hostId)?.rpc('turn/interrupt', { threadId, turnId: tv.activeTurnId });
+    // The host stops whichever turn Codex is running, even if it is not the one shown here.
+    const res = await c.rpc<{ idle?: boolean; turnId?: string }>('turn/interrupt', { threadId, turnId: shown });
+    // A turn started while this was on its way is not touched.
+    if (state.threads[key]?.activeTurnId !== shown) return;
+    if (res?.idle) await settleIdleThread(hostId, threadId, shown);
+    else if (res?.turnId && res.turnId !== shown) {
+      // Follow the turn that was actually stopped, so its end clears the working state.
+      updateThread(key, (cur) => {
+        if (cur.activeTurnId !== shown) return {};
+        const ended = cur.turns.some((t) => t.id === res.turnId && t.status !== 'inProgress');
+        return ended ? { activeTurnId: null, stopping: false } : { activeTurnId: res.turnId };
+      });
+    }
   } catch (err) {
+    updateThread(key, () => ({ stopping: false }));
     toast((err as Error).message);
   }
+}
+
+/** Codex ran nothing in this thread when asked: show what it has and stop showing `stale` as running. */
+async function settleIdleThread(hostId: string, threadId: string, stale: string) {
+  const key = threadKey(hostId, threadId);
+  await loadThread(hostId, threadId, true);
+  updateThread(key, (tv) => ({
+    // A turn that started since then keeps running.
+    ...(tv.activeTurnId === stale ? { activeTurnId: null, stopping: false } : {}),
+    turns: tv.turns.map((t) => (t.id === stale && t.status === 'inProgress' ? { ...t, status: 'interrupted' } : t)),
+  }));
+  void refreshThreads(hostId);
 }
 
 export function respondToRequest(hostId: string, req: ServerReq, result: unknown) {

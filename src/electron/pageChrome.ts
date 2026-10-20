@@ -1,4 +1,5 @@
 import { clipboard, Menu, shell, type BrowserWindow, type ContextMenuParams, type Input, type MenuItemConstructorOptions, type WebContents } from 'electron';
+import { browserAction, nextZoom, shortcutKey, type BrowserAction } from '../shared/browserKeys.js';
 
 /** Back/forward/reload of a page view; for a synced copy these go to the machine that owns the tab. */
 export interface PageNavigation {
@@ -19,26 +20,57 @@ export function localNavigation(wc: WebContents): PageNavigation {
   };
 }
 
-/** Keys pressed in a page view: app shortcuts go to the app window, browser keys to the page. */
-export function handlePageKeys(event: Electron.Event, input: Input, uiWindow: BrowserWindow | null, nav: PageNavigation) {
-  if (input.type !== 'keyDown') return;
-  const mod = process.platform === 'darwin' ? input.meta : input.control;
-  const key = input.key.toLowerCase();
-  if (mod && !input.alt && (key === 'l' || key === 'n' || key === ',' || (key === 'b' && input.shift))) {
+/** Panel actions that need the keyboard in the app window (a text field there takes the next keys). */
+const TAKES_FOCUS = new Set<BrowserAction['type']>(['focusAddress', 'newTab', 'find']);
+
+/**
+ * Keys pressed in a page view: app shortcuts go to the app window, browser shortcuts work like in
+ * any browser. Keys replayed into the page for someone else (`synthetic`) are the page's alone, so
+ * they cannot close or switch tabs here.
+ */
+export function handlePageKeys(event: Electron.Event, input: Input, uiWindow: BrowserWindow | null, nav: PageNavigation, wc: WebContents, synthetic?: () => boolean) {
+  if (input.type !== 'keyDown' || input.isComposing || synthetic?.()) return;
+  const mac = process.platform === 'darwin';
+  const mod = mac ? input.meta : input.control;
+  const key = shortcutKey({ key: input.key, code: input.code });
+  if (mod && !input.alt && (key === 'n' || key === ',' || (key === 'b' && input.shift))) {
     event.preventDefault();
     uiWindow?.webContents.send('app:shortcut', { key, shift: input.shift });
     return;
   }
-  if ((mod && key === 'r') || input.key === 'F5') {
-    event.preventDefault();
-    nav.reload(input.shift);
-    return;
+  const action = browserAction({ key: input.key, code: input.code, ctrl: input.control, meta: input.meta, alt: input.alt, shift: input.shift }, mac);
+  if (!action) return;
+  switch (action.type) {
+    case 'stop':
+      // The panel closes its find bar and stops loading; the page gets its Esc too (closing its own popups).
+      uiWindow?.webContents.send('browser:action', action);
+      return;
+    case 'reload':
+      nav.reload(action.hard);
+      break;
+    case 'back':
+      nav.back();
+      break;
+    case 'forward':
+      nav.forward();
+      break;
+    case 'zoom':
+      wc.setZoomFactor(nextZoom(wc.getZoomFactor(), action.step));
+      uiWindow?.webContents.send('pageView:zoomed', { factor: wc.getZoomFactor() });
+      break;
+    default:
+      // Tabs, the address bar and find belong to the browser panel.
+      if (!uiWindow) return;
+      if (TAKES_FOCUS.has(action.type)) uiWindow.webContents.focus();
+      uiWindow.webContents.send('browser:action', action);
   }
-  if (input.alt && !mod && (input.key === 'ArrowLeft' || input.key === 'ArrowRight')) {
-    event.preventDefault();
-    if (input.key === 'ArrowLeft') nav.back();
-    else nav.forward();
-  }
+  event.preventDefault();
+}
+
+/** Mouse back/forward buttons, reported by the page's preload. */
+export function handleNavButton(action: unknown, nav: PageNavigation) {
+  if (action === 'back') nav.back();
+  else if (action === 'forward') nav.forward();
 }
 
 export function showPageMenu(wc: WebContents, p: ContextMenuParams, uiWindow: BrowserWindow | null, nav: PageNavigation, opts: { newTab: boolean }) {

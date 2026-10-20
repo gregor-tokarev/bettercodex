@@ -14,6 +14,10 @@ Pages always render on the computer you are sitting at, so they feel like any ot
 another machine shows up as a synced copy: what you click and type in it happens on that machine too, and what Codex
 does there shows up in your copy a moment later. Forms are sent once, from the machine that owns the tab.
 
+The address bar completes sites you have been to and suggests searches as you type, and the shortcuts you already
+know work: new, closed and reopened tabs, switching tabs, find in page, zoom, back, forward and reload. When Codex
+heads the wrong way, press Esc or the stop button and it stops, along with whatever it was doing in the browser.
+
 Schedule work the way Codex does, on any of your machines: a daily job that starts a fresh thread, a recurring
 check-in, or a message that comes back to a thread at a set time. Tasks run on the machine they belong to, even while
 the app is closed, and Codex can list, create and change them on its own, on your other machines too.

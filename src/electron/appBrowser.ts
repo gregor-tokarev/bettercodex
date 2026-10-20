@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
-import { handlePageKeys, localNavigation, showPageMenu } from './pageChrome.js';
+import { handleNavButton, handlePageKeys, localNavigation, showPageMenu } from './pageChrome.js';
 import { ViewStage, type Rect } from './stage.js';
 
 /** One persistent profile for every tab; the app's own UI uses the default session. */
@@ -88,6 +88,10 @@ export class AppBrowser extends EventEmitter {
     this.ses = session.fromPartition(PARTITION);
     this.configureSession();
     ipcMain.on('bc:dialog', (event, d) => this.onDialog(event, d));
+    ipcMain.on('bc:nav', (event, action) => {
+      const tab = this.byContents.get(event.sender.id);
+      if (tab) handleNavButton(action, localNavigation(tab.wc));
+    });
     this.devtoolsUrl = await readDevToolsEndpoint(app.getPath('userData'));
     this.contextId = await this.probeContextId();
     this.server.on('upgrade', (req, socket, head) => {
@@ -171,7 +175,9 @@ export class AppBrowser extends EventEmitter {
     wc.on('will-prevent-unload', (event) => event.preventDefault());
     const nav = localNavigation(wc);
     wc.on('context-menu', (_e, params) => showPageMenu(wc, params, this.uiWindow(), nav, { newTab: true }));
-    wc.on('before-input-event', (event, input) => handlePageKeys(event, input, this.uiWindow(), nav));
+    // Keys the agent sends over CDP never come through here, only the person's.
+    wc.on('before-input-event', (event, input) => handlePageKeys(event, input, this.uiWindow(), nav, wc));
+    wc.on('found-in-page', (_e, result) => this.uiWindow()?.webContents.send('pageView:found', result));
     wc.once('destroyed', () => this.removeTab(tab));
   }
 
@@ -185,6 +191,12 @@ export class AppBrowser extends EventEmitter {
 
   tabForTarget(targetId: string | undefined) {
     return targetId ? this.byTarget.get(targetId) : undefined;
+  }
+
+  /** The page of a tab, for the panel's find bar, zoom and focus. */
+  contentsFor(targetId: string) {
+    const wc = this.byTarget.get(targetId)?.wc;
+    return wc && !wc.isDestroyed() ? wc : null;
   }
 
   /** Resolves once a view this app created is known under `targetId`, or false after `ms`. */
