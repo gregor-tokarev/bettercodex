@@ -6,6 +6,7 @@ import type { Locator, Page } from 'playwright-core';
 import { paths } from '../config.js';
 import { errorMessage } from '../log.js';
 import type { BrowserManager } from '../browser/manager.js';
+import { browserInstructions } from './instructions.js';
 import { ReplSession, type ReplImage } from './repl.js';
 
 type Content = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string };
@@ -45,11 +46,16 @@ function text(t: string): Content {
 }
 
 export class BrowserTools {
+  readonly name = 'browser';
   private repls = new Map<string, ReplSession>();
   readonly defs: ToolDef[];
 
   constructor(private browser: BrowserManager) {
     this.defs = this.buildDefs();
+  }
+
+  instructions() {
+    return browserInstructions();
   }
 
   list() {

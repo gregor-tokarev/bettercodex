@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { Thread } from '../../shared/codex-protocol/v2/Thread';
 import { isMac } from '../lib/bridge';
-import { archiveThread, loadMoreThreads, openThread, searchThreads, setPrefs, setState, useStore } from '../lib/store';
+import { archiveThread, loadMoreThreads, openThread, searchThreads, setPrefs, setState, unreadRuns, useStore } from '../lib/store';
 import { HostSwitcher } from './HostSwitcher';
-import { IconArchive, IconChevronDown, IconChevronRight, IconCompose, IconFolder, IconSearch, IconSettings, Spinner } from './Icons';
+import { IconArchive, IconChevronDown, IconChevronRight, IconClock, IconCompose, IconFolder, IconSearch, IconSettings, Spinner } from './Icons';
 
 export function relativeTime(seconds: number) {
   const diff = Date.now() / 1000 - seconds;
@@ -31,6 +31,8 @@ export function Sidebar() {
   const host = useStore((s) => (hostId ? s.hosts[hostId] : null));
   const collapsed = useStore((s) => s.prefs.collapsedProjects);
   const width = useStore((s) => s.prefs.sidebarWidth);
+  const view = useStore((s) => s.view);
+  const unread = useStore(unreadRuns);
   const [query, setQuery] = useState('');
   const [found, setFound] = useState<Thread[] | null>(null);
 
@@ -82,6 +84,11 @@ export function Sidebar() {
           <IconCompose size={15} />
           New thread
         </button>
+        <button className={`sidebar-button ${view === 'scheduled' ? 'active' : ''}`} onClick={() => setState({ view: 'scheduled' })}>
+          <IconClock size={15} />
+          Scheduled
+          {unread > 0 && <span className="count-badge">{unread}</span>}
+        </button>
         <label className="sidebar-search">
           <IconSearch size={14} />
           <input placeholder="Search threads" value={query} onChange={(e) => setQuery(e.target.value)} />
@@ -108,7 +115,7 @@ export function Sidebar() {
                 g.threads.map((t) => (
                   <div
                     key={t.id}
-                    className={`thread-row ${selection?.threadId === t.id ? 'active' : ''}`}
+                    className={`thread-row ${view === 'thread' && selection?.threadId === t.id ? 'active' : ''}`}
                     onClick={() => hostId && void openThread(hostId, t.id)}
                     title={threadTitle(t)}
                   >

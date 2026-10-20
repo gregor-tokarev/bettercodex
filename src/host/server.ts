@@ -13,6 +13,8 @@ import {
   type HostConfig,
   type HostInfo,
   type HostMessage,
+  type RelayMachine,
+  type RelayRequest,
 } from '../shared/types.js';
 import { CodexBridge, RpcError } from './codex.js';
 import { loadConfig, paths, saveConfig } from './config.js';
@@ -21,12 +23,18 @@ import { BrowserManager } from './browser/manager.js';
 import { StreamHub } from './browser/stream.js';
 import { SyncHub } from './browser/sync.js';
 import { BrowserTools } from './mcp/tools.js';
-import { handleMcp, MCP_SERVER_NAME } from './mcp/server.js';
+import { handleMcp, MCP_SERVER_NAME, SCHEDULER_SERVER_NAME } from './mcp/server.js';
+import { ScheduleTools } from './mcp/scheduleTools.js';
+import { Scheduler } from './scheduler.js';
 
 interface Client {
   id: number;
   ws: WebSocket;
+  /** Set once the client offers to relay requests to the other machines it is connected to. */
+  relaySince: number | null;
 }
+
+class RelayUnavailable extends Error {}
 
 const OFFICIAL_BROWSER_PLUGINS = ['browser@openai-bundled', 'chrome@openai-bundled', 'unified-computer-use@openai-bundled'];
 
@@ -37,7 +45,18 @@ export class HostServer {
   readonly streams = new StreamHub(this.browser);
   readonly sync = new SyncHub(this.browser);
   readonly tools = new BrowserTools(this.browser);
+  readonly scheduler = new Scheduler(this.codex, () => this.threadConfig(null));
+  readonly scheduleTools = new ScheduleTools(
+    this.scheduler,
+    {
+      machines: () => this.relay({ op: 'machines' }).then((list) => list as RelayMachine[], (err) => (err instanceof RelayUnavailable ? null : Promise.reject(err))),
+      call: (machine, method, params) => this.relay({ op: 'call', machine, method, params }) as Promise<any>,
+    },
+    this.codex,
+  );
   private clients = new Set<Client>();
+  private relays = new Map<number, { client: Client; resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
+  private nextRelayId = 1;
   private nextClientId = 1;
   private http = http.createServer((req, res) => void this.onHttp(req, res));
   private wss = new WebSocketServer({ noServer: true, handleProtocols: () => WS_SUBPROTOCOL, perMessageDeflate: false });
@@ -54,6 +73,7 @@ export class HostServer {
       this.broadcast({ t: 'notif', method: 'host/info', params: this.info() });
       if (this.codex.status === 'ready') void this.inspectCodexConfig();
     });
+    this.scheduler.on('changed', (snapshot) => this.broadcast({ t: 'notif', method: 'schedule/changed', params: snapshot }));
     this.browser.on('tabs', (tabs) => this.broadcast({ t: 'notif', method: 'browser/tabs', params: { tabs } }));
     this.browser.on('status', () => this.broadcast({ t: 'notif', method: 'host/info', params: this.info() }));
     for (const event of ['download', 'dialog', 'filechooser', 'popup']) {
@@ -94,10 +114,13 @@ export class HostServer {
   }
 
   async start() {
+    this.scheduler.load();
+    this.scheduler.start();
     void this.codex.start();
   }
 
   async shutdown() {
+    this.scheduler.stop();
     for (const client of this.clients) client.ws.close();
     this.codex.stop();
     await this.browser.shutdown();
@@ -142,9 +165,9 @@ export class HostServer {
       if (url.pathname === '/health') {
         return json(res, 200, { ok: true, name: 'bettercodex-host', version: HOST_VERSION, pid: process.pid });
       }
-      if (url.pathname === '/mcp') {
+      if (url.pathname === '/mcp' || url.pathname === `/mcp/${SCHEDULER_SERVER_NAME}`) {
         if (!this.authorized(req, this.mcpToken)) return json(res, 401, { error: 'unauthorized' });
-        return await handleMcp(req, res, this.tools);
+        return await handleMcp(req, res, url.pathname === '/mcp' ? this.tools : this.scheduleTools);
       }
       if (!this.authorized(req, this.clientToken)) return json(res, 401, { error: 'unauthorized' });
       if (url.pathname === '/file' && req.method === 'GET') {
@@ -185,7 +208,7 @@ export class HostServer {
   // ---------- client websocket ----------
 
   private onClient(ws: WebSocket) {
-    const client: Client = { id: this.nextClientId++, ws };
+    const client: Client = { id: this.nextClientId++, ws, relaySince: null };
     this.clients.add(client);
     log.info(`client ${client.id} connected (${this.clients.size} total)`);
     this.send(client, { t: 'notif', method: 'host/info', params: this.info() });
@@ -200,11 +223,47 @@ export class HostServer {
       }
       if (msg.t === 'rpc') void this.onRpc(client, msg.id, msg.method, msg.params);
       else if (msg.t === 'reqres') this.codex.respond(msg.id, msg.result, msg.error);
+      else if (msg.t === 'relay-ready') client.relaySince = Date.now();
+      else if (msg.t === 'relayres') this.onRelayResult(msg.id, msg.result, msg.error);
     });
     ws.on('close', () => {
       this.clients.delete(client);
+      for (const [id, pending] of this.relays) {
+        if (pending.client !== client) continue;
+        this.relays.delete(id);
+        clearTimeout(pending.timer);
+        pending.reject(new Error('The BetterCodex app disconnected'));
+      }
       log.info(`client ${client.id} disconnected`);
     });
+  }
+
+  // ---------- relay to other machines (through the app) ----------
+
+  /** Asks the most recently connected app to reach another machine for us. */
+  private relay(request: RelayRequest, timeoutMs = 60_000): Promise<unknown> {
+    const client = [...this.clients]
+      .filter((c) => c.relaySince !== null && c.ws.readyState === c.ws.OPEN)
+      .sort((a, b) => b.relaySince! - a.relaySince!)[0];
+    if (!client) return Promise.reject(new RelayUnavailable('Other machines are reachable only while the BetterCodex app is open and connected to this machine.'));
+    const id = this.nextRelayId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.relays.delete(id);
+        reject(new Error('The BetterCodex app did not answer in time'));
+      }, timeoutMs);
+      this.relays.set(id, { client, resolve, reject, timer });
+      this.send(client, { t: 'relay', id, request });
+    });
+  }
+
+  private onRelayResult(id: number, result: unknown, error?: { code: number; message: string }) {
+    const pending = this.relays.get(id);
+    if (!pending) return;
+    this.relays.delete(id);
+    clearTimeout(pending.timer);
+    if (error) pending.reject(new RpcError(error.code, error.message));
+    else pending.resolve(result);
   }
 
   private async onRpc(client: Client, id: number, method: string, params: any) {
@@ -220,10 +279,14 @@ export class HostServer {
   private async dispatch(method: string, params: any): Promise<unknown> {
     if (method.startsWith('host/')) return this.hostMethod(method, params);
     if (method.startsWith('browser/')) return this.browserMethod(method, params);
-    if (method === 'thread/start' || method === 'thread/resume' || method === 'thread/fork') {
-      params = { ...params, config: this.threadConfig(params.config) };
-    }
-    return this.codex.request(method, params);
+    if (method.startsWith('schedule/')) return this.scheduler.rpc(method, params);
+    const opensThread = method === 'thread/start' || method === 'thread/resume' || method === 'thread/fork';
+    if (opensThread) params = { ...params, config: this.threadConfig(params.config) };
+    const result = await this.codex.request(method, params);
+    // The scheduler checks thread permissions before letting agents message other threads.
+    if (opensThread) this.scheduler.noteThread(result?.thread?.id, result?.sandbox);
+    else if ((method === 'turn/start' || method === 'thread/settings/update') && params.sandboxPolicy) this.scheduler.noteThread(params.threadId, params.sandboxPolicy);
+    return result;
   }
 
   /** Per-thread overrides that plug the host's browser tools into Codex. */
@@ -235,6 +298,12 @@ export class HostServer {
     config[`${key}.default_tools_approval_mode`] = 'approve';
     config[`${key}.startup_timeout_sec`] = 30;
     config[`${key}.tool_timeout_sec`] = 660;
+    const scheduler = `mcp_servers.${SCHEDULER_SERVER_NAME}`;
+    config[`${scheduler}.url`] = `http://127.0.0.1:${this.port}/mcp/${SCHEDULER_SERVER_NAME}`;
+    config[`${scheduler}.http_headers`] = { Authorization: `Bearer ${this.mcpToken}` };
+    config[`${scheduler}.default_tools_approval_mode`] = 'approve';
+    config[`${scheduler}.startup_timeout_sec`] = 30;
+    config[`${scheduler}.tool_timeout_sec`] = 120;
     if (this.config.codex.disableOfficialBrowser) {
       for (const plugin of OFFICIAL_BROWSER_PLUGINS) config[`plugins.${plugin}.enabled`] = false;
       if (this.hasNodeRepl) config['mcp_servers.node_repl.enabled'] = false;

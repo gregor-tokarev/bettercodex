@@ -1,5 +1,7 @@
 // Wire types shared by the host daemon, the Electron main process and the renderer.
 
+import type { ScheduleSpec } from './schedule.js';
+
 declare const __BUILD_ID__: string | undefined;
 
 /** Includes a hash of the host sources so clients redeploy/restart hosts after any change. */
@@ -117,16 +119,98 @@ export interface AppBrowserRegistration {
   sandboxed?: boolean;
 }
 
+// ---- scheduled tasks ----
+
+/** Permissions of a scheduled run, like the composer's: read only, default (workspace write) or full access. */
+export type TaskAccess = 'read-only' | 'auto' | 'full';
+
+export type TaskTarget =
+  /** Sends the prompt to an existing thread, which keeps its context and settings. */
+  | { type: 'thread'; threadId: string }
+  /** Starts a fresh thread in `cwd` for every run. */
+  | { type: 'newThread'; cwd: string };
+
+/** The agent thread that created or last changed a task; null when the user did it in the app. */
+export interface TaskActor {
+  machine: string;
+  threadId: string;
+  sandboxMode: string | null;
+}
+
+export interface ScheduledTask {
+  id: string;
+  name: string;
+  prompt: string;
+  schedule: ScheduleSpec;
+  target: TaskTarget;
+  /** New-thread runs; null uses the machine's Codex defaults. */
+  model: string | null;
+  effort: string | null;
+  /** New-thread runs get these permissions; for a thread target, the thread's own when the task was made. */
+  access: TaskAccess;
+  status: 'active' | 'paused' | 'completed';
+  nextRunAt: number | null;
+  lastRunAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+  createdBy: TaskActor | null;
+}
+
+export interface ScheduledRun {
+  id: string;
+  taskId: string;
+  taskName: string;
+  trigger: 'schedule' | 'manual';
+  scheduledFor: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+  /** waiting = the target thread is busy; the message goes in once its turn ends. */
+  status: 'waiting' | 'running' | 'completed' | 'failed' | 'interrupted';
+  threadId: string | null;
+  turnId: string | null;
+  /** The run's last agent message. */
+  summary: string | null;
+  error: string | null;
+  read: boolean;
+}
+
+/** Everything the app shows for one machine's schedule (`schedule/list`, `schedule/changed`). */
+export interface ScheduleSnapshot {
+  hostname: string;
+  timezone: string;
+  now: number;
+  tasks: ScheduledTask[];
+  runs: ScheduledRun[];
+}
+
+/**
+ * A host asks the app to reach the other machines it is connected to, so agents can manage
+ * tasks everywhere. `current` marks the machine that asked.
+ */
+export type RelayRequest = { op: 'machines' } | { op: 'call'; machine: string; method: string; params: unknown };
+
+export interface RelayMachine {
+  name: string;
+  hostname: string | null;
+  type: 'local' | 'ssh';
+  connected: boolean;
+  current: boolean;
+}
+
 // ---- main websocket (/ws): JSON text frames ----
 
 export type ClientMessage =
   | { t: 'rpc'; id: number; method: string; params?: unknown }
-  | { t: 'reqres'; id: string | number; result?: unknown; error?: { code: number; message: string } };
+  | { t: 'reqres'; id: string | number; result?: unknown; error?: { code: number; message: string } }
+  /** The client can relay requests to the other machines it is connected to. */
+  | { t: 'relay-ready' }
+  | { t: 'relayres'; id: number; result?: unknown; error?: { code: number; message: string } };
 
 export type HostMessage =
   | { t: 'res'; id: number; result?: unknown; error?: { code: number; message: string; data?: unknown } }
   | { t: 'notif'; method: string; params: unknown }
-  | { t: 'req'; id: string | number; method: string; params: unknown };
+  | { t: 'req'; id: string | number; method: string; params: unknown }
+  | { t: 'relay'; id: number; request: RelayRequest };
 
 // ---- browser stream websocket (/stream) ----
 

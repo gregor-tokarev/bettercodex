@@ -19,6 +19,10 @@ export const paths = {
   log: path.join(BC_HOME, 'host.log'),
   /** How to start the BetterCodex app installed on this machine, recorded when it registers. */
   app: path.join(BC_HOME, 'app.json'),
+  /** Scheduled tasks and their recent runs. */
+  schedules: path.join(BC_HOME, 'schedules.json'),
+  /** Per-task folders holding the memory file new-thread runs keep between runs. */
+  tasks: path.join(BC_HOME, 'tasks'),
 };
 
 export function ensureDirs() {
