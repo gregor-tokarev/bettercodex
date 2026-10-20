@@ -167,3 +167,27 @@ export type StreamHostMessage =
   | { t: 'cursor'; cursor: string }
   | { t: 'clipboard'; text: string }
   | { t: 'error'; message: string };
+
+/** The app's self-update, as shown in the renderer. */
+export interface UpdateStatus {
+  /** This build's release name, e.g. v0.0.1-660c757e94 (the bare version for builds made outside CI). */
+  current: string;
+  /**
+   * How this copy updates: in place (the .app on macOS, the AppImage on Linux), from the release page
+   * (a .deb install, a quarantined Mac app) or not at all (development builds, builds made outside CI).
+   */
+  mode: 'inPlace' | 'manual' | 'off';
+  /** Why the copy cannot update in place. */
+  note: string | null;
+  /** `ready`: downloaded and unpacked, waiting for the restart that puts it in place. */
+  state: 'idle' | 'checking' | 'downloading' | 'installing' | 'ready';
+  /** A newer release than this build, if there is one. */
+  available: { name: string; url: string; compareUrl: string | null; publishedAt: string } | null;
+  /** Downloaded fraction while downloading. */
+  progress: number | null;
+  /** The last failed check. */
+  error: string | null;
+  /** The last failed install, including one that rolled back after a restart. */
+  installError: string | null;
+  checkedAt: number | null;
+}

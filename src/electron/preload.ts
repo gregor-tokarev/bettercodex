@@ -39,6 +39,13 @@ contextBridge.exposeInMainWorld('bc', {
     status: (hostId: string, tabId: string) => ipcRenderer.invoke('replica:status', hostId, tabId),
     onStatus: on('replica:status'),
   },
+  updates: {
+    status: () => ipcRenderer.invoke('updates:status'),
+    check: () => ipcRenderer.invoke('updates:check'),
+    install: () => ipcRenderer.invoke('updates:install'),
+    restart: () => ipcRenderer.invoke('updates:restart'),
+    onStatus: on('updates:status'),
+  },
   onShortcut: on('app:shortcut'),
   openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url),
   appInfo: () => ipcRenderer.invoke('app:info'),

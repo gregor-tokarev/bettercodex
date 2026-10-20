@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { Thread } from '../../shared/codex-protocol/v2/Thread';
 import { isMac } from '../lib/bridge';
-import { archiveThread, loadMoreThreads, openThread, searchThreads, setPrefs, setState, useStore } from '../lib/store';
+import { archiveThread, installUpdate, loadMoreThreads, openThread, searchThreads, setPrefs, setState, useStore } from '../lib/store';
 import { HostSwitcher } from './HostSwitcher';
-import { IconArchive, IconChevronDown, IconChevronRight, IconCompose, IconFolder, IconSearch, IconSettings, Spinner } from './Icons';
+import { IconArchive, IconChevronDown, IconChevronRight, IconCompose, IconDownload, IconFolder, IconSearch, IconSettings, Spinner } from './Icons';
 
 export function relativeTime(seconds: number) {
   const diff = Date.now() / 1000 - seconds;
@@ -23,6 +23,28 @@ export function threadTitle(t: Thread) {
 function projectName(cwd: string, home: string | undefined) {
   if (home && cwd === home) return '~';
   return cwd.split('/').filter(Boolean).pop() ?? cwd;
+}
+
+function UpdateButton() {
+  const update = useStore((s) => s.update);
+  if (!update?.available || update.mode === 'off') return null;
+  const busy = update.state === 'downloading' || update.state === 'installing';
+  const label =
+    update.state === 'downloading'
+      ? `Downloading update… ${Math.round((update.progress ?? 0) * 100)}%`
+      : update.state === 'installing'
+        ? 'Installing update…'
+        : update.state === 'ready'
+          ? 'Restart to update'
+          : update.mode === 'manual'
+            ? 'Download update'
+            : 'Update and restart';
+  return (
+    <button className="sidebar-button update" disabled={busy} title={`${update.current} → ${update.available.name}`} onClick={() => void installUpdate()}>
+      {busy ? <Spinner size={13} /> : <IconDownload size={15} />}
+      {label}
+    </button>
+  );
 }
 
 export function Sidebar() {
@@ -137,6 +159,7 @@ export function Sidebar() {
         )}
       </div>
       <div className="sidebar-bottom">
+        <UpdateButton />
         <button className="sidebar-button subtle" onClick={() => setState({ settingsOpen: true })}>
           <IconSettings size={15} />
           Settings

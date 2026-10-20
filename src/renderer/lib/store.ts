@@ -1,5 +1,5 @@
 import { useRef, useSyncExternalStore } from 'react';
-import type { DownloadInfo, HostInfo, HostMessage, TabInfo } from '../../shared/types';
+import type { DownloadInfo, HostInfo, HostMessage, TabInfo, UpdateStatus } from '../../shared/types';
 import type { Model } from '../../shared/codex-protocol/v2/Model';
 import type { Thread } from '../../shared/codex-protocol/v2/Thread';
 import type { ThreadItem } from '../../shared/codex-protocol/v2/ThreadItem';
@@ -102,6 +102,7 @@ export interface AppState {
   toast: string | null;
   /** This app process; a host whose browser is this app shows its tabs natively. */
   appInstanceId: string | null;
+  update: UpdateStatus | null;
 }
 
 const PREFS_KEY = 'bettercodex.prefs';
@@ -142,6 +143,7 @@ let state: AppState = {
   settingsOpen: false,
   toast: null,
   appInstanceId: null,
+  update: null,
 };
 const listeners = new Set<Listener>();
 
@@ -210,6 +212,25 @@ export function toast(message: string) {
   toastTimer = setTimeout(() => setState({ toast: null }), 5000);
 }
 
+const ipcMessage = (err: Error) => err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
+
+/**
+ * Downloads the available update and restarts into it. Codex may have started working during the
+ * download, and a newer host restarts it, so that is checked right before the restart.
+ */
+export async function installUpdate() {
+  try {
+    const update = state.update?.state === 'ready' ? state.update : await bc.updates.install();
+    if (update.state !== 'ready') return;
+    const working =
+      Object.values(state.threads).some((t) => t.activeTurnId) || Object.values(state.hosts).some((h) => h.threads.some((t) => t.status.type === 'active'));
+    if (working && !window.confirm('Codex is still working in a thread, and updating may stop it. Restart BetterCodex now?')) return;
+    await bc.updates.restart();
+  } catch (err) {
+    toast(ipcMessage(err as Error));
+  }
+}
+
 // ---------- connections ----------
 
 export const connections = new Map<string, HostConnection>();
@@ -242,6 +263,12 @@ function hostViewFrom(entry: HostListEntry, prev?: HostView): HostView {
 
 export async function initApp() {
   void bc.appInfo().then((info) => setState({ appInstanceId: info.instanceId }));
+  void bc.updates.status().then((update) => {
+    setState({ update });
+    // An update that rolled back after the last restart.
+    if (update.installError) toast(update.installError);
+  });
+  bc.updates.onStatus((update) => setState({ update }));
   const list = await bc.hosts.list();
   applyHostList(list);
   bc.hosts.onChanged(applyHostList);
